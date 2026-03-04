@@ -463,7 +463,22 @@ impl ContainerRuntime for LimaRuntime {
         Ok(())
     }
 
-    async fn terminal_command(&self, project_id: &str, host_api_url: &str) -> Result<(PathBuf, Vec<String>), TerrariumError> {
+    async fn has_claude_sessions(&self, project_id: &str) -> Result<bool, TerrariumError> {
+        let ns = Self::namespace_name(project_id);
+        let output = self
+            .run_nerdctl(Some(&ns), &[
+                "exec", "--user", "terrarium", "dev",
+                "find", "/home/terrarium/.claude/projects",
+                "-name", "*.jsonl", "-print", "-quit",
+            ])
+            .await?;
+        if !output.status.success() {
+            return Ok(false); // directory doesn't exist = no sessions
+        }
+        Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+    }
+
+    async fn terminal_command(&self, project_id: &str, host_api_url: &str, continue_session: bool) -> Result<(PathBuf, Vec<String>), TerrariumError> {
         let limactl = self.limactl_path.clone().ok_or(TerrariumError::LimaNotInstalled)?;
         let ns = Self::namespace_name(project_id);
 
@@ -490,7 +505,11 @@ impl ContainerRuntime for LimaRuntime {
             "dev".to_string(),
             "bash".to_string(),
             "-lc".to_string(),
-            "tmux new-session -A -s claude 'claude'".to_string(),
+            if continue_session {
+                "claude --continue".to_string()
+            } else {
+                "claude".to_string()
+            },
         ];
 
         Ok((limactl, args))

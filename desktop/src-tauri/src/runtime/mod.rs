@@ -52,8 +52,11 @@ pub trait ContainerRuntime: Send + Sync {
     /// Get the status of the dev container in a project's namespace.
     async fn dev_container_status(&self, project_id: &str) -> Result<ContainerStatus, TerrariumError>;
 
+    /// Check whether the dev container has any previous Claude Code sessions.
+    async fn has_claude_sessions(&self, project_id: &str) -> Result<bool, TerrariumError>;
+
     /// Get the command (program + args) to open a terminal session in a project's dev container.
-    async fn terminal_command(&self, project_id: &str, host_api_url: &str) -> Result<(PathBuf, Vec<String>), TerrariumError>;
+    async fn terminal_command(&self, project_id: &str, host_api_url: &str, continue_session: bool) -> Result<(PathBuf, Vec<String>), TerrariumError>;
 
     /// Get the host gateway IP as seen from inside the VM.
     async fn host_gateway_ip(&self) -> Result<String, TerrariumError>;

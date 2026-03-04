@@ -9,7 +9,6 @@ RUN apt-get update && apt-get install -y \
     curl \
     wget \
     build-essential \
-    tmux \
     sudo \
     ca-certificates \
     gnupg \
@@ -57,5 +56,5 @@ RUN mkdir -p /home/terrarium/.claude && \
 
 WORKDIR /home/terrarium/workspace
 
-# Container stays alive; tmux sessions started on demand
+# Container stays alive; Claude Code sessions started on demand
 CMD ["sleep", "infinity"]

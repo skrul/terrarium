@@ -190,11 +190,21 @@ async fn open_terminal(
     Ok(())
 }
 
+/// Check whether a project's dev container has previous Claude Code sessions.
+#[tauri::command]
+async fn check_claude_sessions(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    state.runtime.has_claude_sessions(&project_id).await.map_err(|e| e.to_string())
+}
+
 /// Called from TerminalView after event listeners are set up.
 /// Starts (or reattaches to) the PTY session.
 #[tauri::command]
 async fn start_terminal(
     project_id: String,
+    continue_session: bool,
     cols: u16,
     rows: u16,
     app: AppHandle,
@@ -218,7 +228,7 @@ async fn start_terminal(
     // Get the terminal command from the runtime
     let (program, args) = state
         .runtime
-        .terminal_command(&project_id, &host_api_url)
+        .terminal_command(&project_id, &host_api_url, continue_session)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -294,6 +304,7 @@ pub fn run() {
             start_vm,
             stop_vm,
             open_terminal,
+            check_claude_sessions,
             start_terminal,
             write_terminal,
             resize_terminal,
