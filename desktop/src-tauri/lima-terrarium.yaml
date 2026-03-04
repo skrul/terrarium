@@ -1,0 +1,28 @@
+vmType: "vz"
+cpus: 4
+memory: "4GiB"
+disk: "50GiB"
+mountType: "virtiofs"
+
+mounts:
+  - location: "~"
+    writable: false
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+    arch: "x86_64"
+
+containerd:
+  system: true
+  user: false
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      # Ensure nerdctl is available
+      if ! command -v nerdctl &> /dev/null; then
+        echo "nerdctl not found, it should be installed by Lima"
+      fi

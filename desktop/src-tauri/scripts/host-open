@@ -1,0 +1,8 @@
+#!/bin/bash
+if [ -z "$TERRARIUM_HOST_API" ]; then
+  echo "Open this URL in your browser: $1"
+  exit 0
+fi
+curl -sf -X POST "${TERRARIUM_HOST_API}/open-url" \
+  -H "Content-Type: application/json" \
+  -d "{\"url\":\"$1\"}" 2>/dev/null || echo "Open this URL in your browser: $1"

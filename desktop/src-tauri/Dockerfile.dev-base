@@ -1,0 +1,57 @@
+FROM ubuntu:24.04
+
+# Avoid interactive prompts during package install
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install essential dev tools
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    wget \
+    build-essential \
+    tmux \
+    sudo \
+    ca-certificates \
+    gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 22 LTS (required for MCP server)
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create terrarium user with passwordless sudo
+RUN useradd -m -s /bin/bash terrarium \
+    && echo "terrarium ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/terrarium \
+    && chmod 0440 /etc/sudoers.d/terrarium
+
+# Copy TERRARIUM.md orientation file
+COPY desktop/src-tauri/TERRARIUM.md /etc/terrarium/TERRARIUM.md
+RUN chmod 444 /etc/terrarium/TERRARIUM.md
+
+# Copy MCP server bundle
+COPY mcp-server/dist/terrarium-mcp.js /opt/terrarium/mcp-server/terrarium-mcp.js
+RUN chmod +x /opt/terrarium/mcp-server/terrarium-mcp.js
+
+# Create state directory (writable by terrarium user)
+RUN chown terrarium:terrarium /etc/terrarium
+
+# Create workspace directory
+RUN mkdir -p /home/terrarium/workspace && chown terrarium:terrarium /home/terrarium/workspace
+
+# Install browser proxy script (forwards open-url requests to host API)
+COPY desktop/src-tauri/scripts/host-open /usr/local/bin/host-open
+RUN chmod +x /usr/local/bin/host-open
+
+USER terrarium
+
+# Install Claude Code via native installer (installs to ~/.local/bin/claude)
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# Configure Claude Code to use the Terrarium MCP server
+RUN echo '{"mcpServers":{"terrarium":{"command":"node","args":["/opt/terrarium/mcp-server/terrarium-mcp.js"],"type":"stdio"}}}' > /home/terrarium/.claude.json
+
+WORKDIR /home/terrarium/workspace
+
+# Container stays alive; tmux sessions started on demand
+CMD ["sleep", "infinity"]
