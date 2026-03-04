@@ -51,6 +51,10 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 # Configure Claude Code to use the Terrarium MCP server
 RUN echo '{"mcpServers":{"terrarium":{"command":"node","args":["/opt/terrarium/mcp-server/terrarium-mcp.js"],"type":"stdio"}}}' > /home/terrarium/.claude.json
 
+# Pre-approve all Terrarium MCP tools so the user isn't prompted
+RUN mkdir -p /home/terrarium/.claude && \
+    echo '{"permissions":{"allow":["mcp__terrarium__*"]}}' > /home/terrarium/.claude/settings.json
+
 WORKDIR /home/terrarium/workspace
 
 # Container stays alive; tmux sessions started on demand

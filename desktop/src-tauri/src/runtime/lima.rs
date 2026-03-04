@@ -404,10 +404,32 @@ impl ContainerRuntime for LimaRuntime {
             }
         }
 
+        // Bind-mount frequently-changing files from the host repo so that
+        // edits are visible without rebuilding the dev image.
+        let repo_root = self.find_repo_root()?;
+        let mcp_mount = format!(
+            "{}:/opt/terrarium/mcp-server/terrarium-mcp.js:ro",
+            repo_root.join("mcp-server/dist/terrarium-mcp.js").display()
+        );
+        let terrarium_md_mount = format!(
+            "{}:/etc/terrarium/TERRARIUM.md:ro",
+            repo_root.join("desktop/src-tauri/TERRARIUM.md").display()
+        );
+        let host_open_mount = format!(
+            "{}:/usr/local/bin/host-open:ro",
+            repo_root.join("desktop/src-tauri/scripts/host-open").display()
+        );
+
         let output = self
             .run_nerdctl(
                 Some(&ns),
-                &["run", "-d", "--name", "dev", DEV_IMAGE],
+                &[
+                    "run", "-d", "--name", "dev",
+                    "-v", &mcp_mount,
+                    "-v", &terrarium_md_mount,
+                    "-v", &host_open_mount,
+                    DEV_IMAGE,
+                ],
             )
             .await?;
 
