@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useProjects } from "../hooks/useProjects";
 import { useVmStatus } from "../hooks/useVmStatus";
@@ -14,6 +14,8 @@ export function ProjectDashboard() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [authStatus, setAuthStatus] = useState<boolean | null>(null);
   const [authLoading, setAuthLoading] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const authCancelledRef = useRef(false);
 
   const checkAuth = useCallback(() => {
     if (vm.status !== "Running") return;
@@ -37,14 +39,28 @@ export function ProjectDashboard() {
 
   const startOAuthFlow = async () => {
     setAuthLoading(true);
+    setAuthError(null);
+    authCancelledRef.current = false;
     try {
       await invoke("start_oauth_flow");
       checkAuth();
     } catch (err) {
-      console.error("OAuth flow failed:", err);
+      if (!authCancelledRef.current) {
+        setAuthError(String(err));
+      }
     } finally {
       setAuthLoading(false);
     }
+  };
+
+  const cancelOAuthFlow = async () => {
+    authCancelledRef.current = true;
+    try {
+      await invoke("cancel_oauth_flow");
+    } catch (err) {
+      console.error("Cancel failed:", err);
+    }
+    setAuthLoading(false);
   };
 
   const openTerminal = async (projectId: string) => {
@@ -77,25 +93,55 @@ export function ProjectDashboard() {
       </div>
 
       {vm.status === "Running" && authStatus === false && (
-        <div className="mb-4 flex items-center justify-between rounded-md bg-amber-50 border border-amber-200 px-4 py-3">
-          <span className="text-sm text-amber-800">
-            Claude Code is not signed in. Sign in once to authenticate all projects.
-          </span>
-          <button
-            onClick={startOAuthFlow}
-            disabled={authLoading}
-            className="ml-4 rounded-md bg-amber-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-700 disabled:opacity-50"
-          >
-            {authLoading ? "Signing in..." : "Sign in to Claude"}
-          </button>
+        <div className="mb-4 rounded-md bg-amber-50 border border-amber-200 px-4 py-3">
+          <div className="flex items-center justify-between">
+            <span className="text-sm text-amber-800">
+              {authLoading
+                ? "Waiting for sign-in to complete in your browser..."
+                : "Claude Code is not signed in. Sign in once to authenticate all projects."}
+            </span>
+            <div className="ml-4 flex gap-2">
+              {authLoading ? (
+                <button
+                  onClick={cancelOAuthFlow}
+                  className="rounded-md bg-gray-500 px-3 py-1.5 text-sm font-medium text-white hover:bg-gray-600"
+                >
+                  Cancel
+                </button>
+              ) : (
+                <button
+                  onClick={startOAuthFlow}
+                  className="rounded-md bg-amber-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-700"
+                >
+                  Sign in to Claude
+                </button>
+              )}
+            </div>
+          </div>
+          {authError && (
+            <p className="mt-2 text-sm text-red-700">{authError}</p>
+          )}
         </div>
       )}
 
       {vm.status === "Running" && authStatus === true && (
-        <div className="mb-4 flex items-center rounded-md bg-green-50 border border-green-200 px-4 py-3">
+        <div className="mb-4 flex items-center justify-between rounded-md bg-green-50 border border-green-200 px-4 py-3">
           <span className="text-sm text-green-800">
             Claude Code: Signed in
           </span>
+          <button
+            onClick={async () => {
+              try {
+                await invoke("sign_out");
+                checkAuth();
+              } catch (err) {
+                console.error("Sign out failed:", err);
+              }
+            }}
+            className="ml-4 rounded-md bg-green-700 px-3 py-1.5 text-sm font-medium text-white hover:bg-green-800"
+          >
+            Sign out
+          </button>
         </div>
       )}
 

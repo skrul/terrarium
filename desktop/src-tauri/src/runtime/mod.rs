@@ -67,6 +67,12 @@ pub trait ContainerRuntime: Send + Sync {
     /// Check if shared auth credentials exist (beyond just settings.json).
     async fn has_auth_credentials(&self) -> Result<bool, TerrariumError>;
 
+    /// Remove shared auth credentials (sign out).
+    async fn remove_auth_credentials(&self) -> Result<(), TerrariumError>;
+
+    /// Cancel an in-progress auth login by killing the auth container.
+    async fn cancel_auth_login(&self) -> Result<(), TerrariumError>;
+
     /// Run `claude auth login` headlessly in a temporary auth container.
     /// Opens the browser via host-open, waits for OAuth to complete.
     async fn run_auth_login(&self, host_api_url: &str) -> Result<(), TerrariumError>;

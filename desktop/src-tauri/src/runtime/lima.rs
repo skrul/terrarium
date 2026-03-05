@@ -593,6 +593,27 @@ impl ContainerRuntime for LimaRuntime {
         Ok(output.status.success())
     }
 
+    async fn remove_auth_credentials(&self) -> Result<(), TerrariumError> {
+        let cmd = format!("rm -f {}/.credentials.json", AUTH_DIR);
+        let output = self.run_shell_bash(&cmd).await?;
+
+        if !output.status.success() {
+            return Err(TerrariumError::Internal {
+                message: format!(
+                    "Failed to remove auth credentials: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn cancel_auth_login(&self) -> Result<(), TerrariumError> {
+        let _ = self.run_nerdctl(None, &["rm", "-f", AUTH_CONTAINER]).await;
+        Ok(())
+    }
+
     async fn run_auth_login(&self, host_api_url: &str) -> Result<(), TerrariumError> {
         // Remove any leftover auth container
         let _ = self.run_nerdctl(None, &["rm", "-f", AUTH_CONTAINER]).await;
@@ -638,20 +659,29 @@ impl ContainerRuntime for LimaRuntime {
             });
         }
 
-        // Run auth login via exec
-        let login_output = self
-            .run_nerdctl(
-                None,
-                &[
-                    "exec",
-                    "-e", &host_api_env,
-                    "-e", "BROWSER=/usr/local/bin/host-open",
-                    "--user", "terrarium",
-                    AUTH_CONTAINER,
-                    "/home/terrarium/.local/bin/claude", "auth", "login",
-                ],
-            )
-            .await?;
+        // Run auth login via exec (with 3-minute timeout)
+        let login_args: Vec<&str> = vec![
+            "exec",
+            "-e", &host_api_env,
+            "-e", "BROWSER=/usr/local/bin/host-open",
+            "--user", "terrarium",
+            AUTH_CONTAINER,
+            "/home/terrarium/.local/bin/claude", "auth", "login",
+        ];
+        let login_future = self.run_nerdctl(None, &login_args);
+
+        let login_output = match tokio::time::timeout(
+            std::time::Duration::from_secs(180),
+            login_future,
+        ).await {
+            Ok(result) => result?,
+            Err(_) => {
+                let _ = self.run_nerdctl(None, &["rm", "-f", AUTH_CONTAINER]).await;
+                return Err(TerrariumError::ContainerError {
+                    message: "Auth login timed out after 3 minutes. Please try again.".to_string(),
+                });
+            }
+        };
 
         let stdout = String::from_utf8_lossy(&login_output.stdout);
         let stderr = String::from_utf8_lossy(&login_output.stderr);

@@ -200,6 +200,26 @@ async fn start_oauth_flow(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// Cancel an in-progress OAuth flow by killing the auth container.
+#[tauri::command]
+async fn cancel_oauth_flow(state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .runtime
+        .cancel_auth_login()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Remove shared auth credentials (sign out of Claude Code).
+#[tauri::command]
+async fn sign_out(state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .runtime
+        .remove_auth_credentials()
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Called from the dashboard to create/focus the terminal window.
 /// Does NOT start the PTY — that happens when TerminalView calls start_terminal.
 #[tauri::command]
@@ -358,6 +378,8 @@ pub fn run() {
             stop_vm,
             check_auth_status,
             start_oauth_flow,
+            cancel_oauth_flow,
+            sign_out,
             open_terminal,
             check_claude_sessions,
             start_terminal,
