@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { SessionPromptDialog } from "./SessionPromptDialog";
 import "@xterm/xterm/css/xterm.css";
 
@@ -67,8 +67,9 @@ export function TerminalView({ projectId }: Props) {
     const cols = term.cols;
     const rows = term.rows;
 
-    // Listen for terminal output (base64-encoded)
-    const unlistenOutput = listen<string>("terminal-output", (event) => {
+    // Listen for terminal output (base64-encoded), scoped to this window
+    const currentWindow = getCurrentWindow();
+    const unlistenOutput = currentWindow.listen<string>("terminal-output", (event) => {
       const bytes = Uint8Array.from(atob(event.payload), (c) =>
         c.charCodeAt(0)
       );
@@ -76,7 +77,7 @@ export function TerminalView({ projectId }: Props) {
     });
 
     // Listen for session exit
-    const unlistenExit = listen<string>("terminal-exit", () => {
+    const unlistenExit = currentWindow.listen<string>("terminal-exit", () => {
       term.write(
         "\r\n\x1b[90m[Session ended. Close this window or click Open to reconnect.]\x1b[0m\r\n"
       );

@@ -113,8 +113,9 @@ impl TerminalManager {
                 }
                 Ok(n) => {
                     let encoded = BASE64.encode(&buf[..n]);
-                    if let Some(window) = app.get_webview_window(&window_label) {
-                        let result = window.emit("terminal-output", &encoded);
+                    if app.get_webview_window(&window_label).is_some() {
+                        // emit_to targets only the specific window's listeners
+                        let result = app.emit_to(&window_label, "terminal-output", &encoded);
                         if result.is_err() {
                             eprintln!("[read_loop] emit failed for session={}: {:?}", session_id, result);
                         }
@@ -132,8 +133,8 @@ impl TerminalManager {
 
         eprintln!("[read_loop] ended for session={}", session_id);
         // Notify the window the session has ended
-        if let Some(window) = app.get_webview_window(&window_label) {
-            let _ = window.emit("terminal-exit", &session_id);
+        if app.get_webview_window(&window_label).is_some() {
+            let _ = app.emit_to(&window_label, "terminal-exit", &session_id);
         }
     }
 
