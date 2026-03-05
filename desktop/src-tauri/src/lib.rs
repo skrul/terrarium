@@ -147,6 +147,59 @@ async fn stop_vm(state: State<'_, AppState>) -> Result<(), String> {
     state.runtime.stop_vm().await.map_err(|e| e.to_string())
 }
 
+/// Check if global Claude Code auth credentials exist.
+#[tauri::command]
+async fn check_auth_status(state: State<'_, AppState>) -> Result<bool, String> {
+    state
+        .runtime
+        .has_auth_credentials()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Run the OAuth flow headlessly: starts auth container, runs `claude auth login`,
+/// opens browser via host-open, waits for completion.
+#[tauri::command]
+async fn start_oauth_flow(state: State<'_, AppState>) -> Result<(), String> {
+    // Ensure VM is ready
+    state
+        .runtime
+        .ensure_vm_ready()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Ensure dev image is built
+    state
+        .runtime
+        .ensure_dev_image()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Ensure auth directory exists on VM
+    state
+        .runtime
+        .ensure_auth_dir()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Determine the host API URL as seen from inside the VM
+    let gateway_ip = state
+        .runtime
+        .host_gateway_ip()
+        .await
+        .map_err(|e| e.to_string())?;
+    let host_api_url = format!("http://{}:{}", gateway_ip, state.host_api_port);
+
+    // Run claude auth login headlessly
+    state
+        .runtime
+        .run_auth_login(&host_api_url)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
 /// Called from the dashboard to create/focus the terminal window.
 /// Does NOT start the PTY — that happens when TerminalView calls start_terminal.
 #[tauri::command]
@@ -303,6 +356,8 @@ pub fn run() {
             get_vm_status,
             start_vm,
             stop_vm,
+            check_auth_status,
+            start_oauth_flow,
             open_terminal,
             check_claude_sessions,
             start_terminal,

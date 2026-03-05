@@ -60,4 +60,14 @@ pub trait ContainerRuntime: Send + Sync {
 
     /// Get the host gateway IP as seen from inside the VM.
     async fn host_gateway_ip(&self) -> Result<String, TerrariumError>;
+
+    /// Ensure the shared auth directory exists on the VM.
+    async fn ensure_auth_dir(&self) -> Result<(), TerrariumError>;
+
+    /// Check if shared auth credentials exist (beyond just settings.json).
+    async fn has_auth_credentials(&self) -> Result<bool, TerrariumError>;
+
+    /// Run `claude auth login` headlessly in a temporary auth container.
+    /// Opens the browser via host-open, waits for OAuth to complete.
+    async fn run_auth_login(&self, host_api_url: &str) -> Result<(), TerrariumError>;
 }

@@ -103,22 +103,34 @@ impl TerminalManager {
         window_label: String,
         session_id: String,
     ) {
+        eprintln!("[read_loop] started for session={} window={}", session_id, window_label);
         let mut buf = [0u8; 4096];
         loop {
             match reader.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) => {
+                    eprintln!("[read_loop] EOF for session={}", session_id);
+                    break;
+                }
                 Ok(n) => {
                     let encoded = BASE64.encode(&buf[..n]);
                     if let Some(window) = app.get_webview_window(&window_label) {
-                        let _ = window.emit("terminal-output", &encoded);
+                        let result = window.emit("terminal-output", &encoded);
+                        if result.is_err() {
+                            eprintln!("[read_loop] emit failed for session={}: {:?}", session_id, result);
+                        }
                     } else {
+                        eprintln!("[read_loop] window '{}' not found, breaking for session={}", window_label, session_id);
                         break;
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    eprintln!("[read_loop] read error for session={}: {}", session_id, e);
+                    break;
+                }
             }
         }
 
+        eprintln!("[read_loop] ended for session={}", session_id);
         // Notify the window the session has ended
         if let Some(window) = app.get_webview_window(&window_label) {
             let _ = window.emit("terminal-exit", &session_id);
@@ -172,13 +184,17 @@ impl TerminalManager {
     }
 
     pub async fn close(&self, session_id: &str) {
+        eprintln!("[terminal] close called for session={}", session_id);
         let mut sessions = self.sessions.lock().await;
         if let Some(mut session) = sessions.remove(session_id) {
+            eprintln!("[terminal] closing session={}, dropping writer and killing child", session_id);
             // Drop the writer to close stdin
             drop(session.writer);
             // Kill the child process
             let _ = session.child.kill();
             // Master will be dropped, closing the PTY
+        } else {
+            eprintln!("[terminal] close: session={} not found (already closed?)", session_id);
         }
     }
 

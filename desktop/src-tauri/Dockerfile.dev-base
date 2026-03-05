@@ -47,8 +47,8 @@ USER terrarium
 # Install Claude Code via native installer (installs to ~/.local/bin/claude)
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
-# Configure Claude Code to use the Terrarium MCP server
-RUN echo '{"mcpServers":{"terrarium":{"command":"node","args":["/opt/terrarium/mcp-server/terrarium-mcp.js"],"type":"stdio"}}}' > /home/terrarium/.claude.json
+# Configure Claude Code to use the Terrarium MCP server, skip onboarding, and trust the workspace
+RUN echo '{"mcpServers":{"terrarium":{"command":"node","args":["/opt/terrarium/mcp-server/terrarium-mcp.js"],"type":"stdio"}},"hasCompletedOnboarding":true,"firstStartTime":"2025-01-01T00:00:00.000Z","numStartups":1,"projects":{"/home/terrarium/workspace":{"hasTrustDialogAccepted":true,"allowedTools":[],"hasCompletedProjectOnboarding":true}}}' > /home/terrarium/.claude.json
 
 # Pre-approve all Terrarium MCP tools so the user isn't prompted
 RUN mkdir -p /home/terrarium/.claude && \

@@ -11,6 +11,9 @@ const DEV_IMAGE: &str = "terrarium/dev-base:latest";
 
 const VM_NAME: &str = "terrarium";
 
+const AUTH_DIR: &str = "/opt/terrarium/claude-auth";
+const AUTH_CONTAINER: &str = "terrarium-auth";
+
 pub struct LimaRuntime {
     limactl_path: Option<PathBuf>,
 }
@@ -253,6 +256,13 @@ impl ContainerRuntime for LimaRuntime {
         );
         let _ = self.run_shell_bash(&cmd).await;
 
+        // Remove all volumes in the namespace
+        let cmd = format!(
+            "nerdctl --namespace {} volume ls -q | xargs -r nerdctl --namespace {} volume rm",
+            ns, ns
+        );
+        let _ = self.run_shell_bash(&cmd).await;
+
         // Remove all images in the namespace
         let cmd = format!(
             "nerdctl --namespace {} images -q | xargs -r nerdctl --namespace {} rmi -f",
@@ -419,12 +429,12 @@ impl ContainerRuntime for LimaRuntime {
             "{}:/usr/local/bin/host-open:ro",
             repo_root.join("desktop/src-tauri/scripts/host-open").display()
         );
-
         let output = self
             .run_nerdctl(
                 Some(&ns),
                 &[
                     "run", "-d", "--name", "dev",
+                    "-v", "claude-config:/home/terrarium/.claude",
                     "-v", &mcp_mount,
                     "-v", &terrarium_md_mount,
                     "-v", &host_open_mount,
@@ -481,6 +491,17 @@ impl ContainerRuntime for LimaRuntime {
     async fn terminal_command(&self, project_id: &str, host_api_url: &str, continue_session: bool) -> Result<(PathBuf, Vec<String>), TerrariumError> {
         let limactl = self.limactl_path.clone().ok_or(TerrariumError::LimaNotInstalled)?;
         let ns = Self::namespace_name(project_id);
+
+        // Seed auth credentials into the dev container if they exist in the shared auth dir
+        // but are not yet present in the container
+        let seed_cmd = format!(
+            "test -f {auth}/.credentials.json && \
+             ! nerdctl --namespace {ns} exec --user terrarium dev test -f /home/terrarium/.claude/.credentials.json 2>/dev/null && \
+             cat {auth}/.credentials.json | nerdctl --namespace {ns} exec -i --user terrarium dev tee /home/terrarium/.claude/.credentials.json > /dev/null",
+            auth = AUTH_DIR,
+            ns = ns,
+        );
+        let _ = self.run_shell_bash(&seed_cmd).await;
 
         let args = vec![
             "shell".to_string(),
@@ -546,6 +567,168 @@ impl ContainerRuntime for LimaRuntime {
             .to_string();
 
         Ok(ip)
+    }
+
+    async fn ensure_auth_dir(&self) -> Result<(), TerrariumError> {
+        // Create the directory and chown to UID 1000 (terrarium user inside containers)
+        // so Claude Code can write auth credentials to the bind-mounted ~/.claude/
+        let cmd = format!("mkdir -p {} && chown 1000:1000 {}", AUTH_DIR, AUTH_DIR);
+        let output = self.run_shell_bash(&cmd).await?;
+
+        if !output.status.success() {
+            return Err(TerrariumError::Internal {
+                message: format!(
+                    "Failed to create auth dir: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn has_auth_credentials(&self) -> Result<bool, TerrariumError> {
+        let cmd = format!("test -f {}/.credentials.json", AUTH_DIR);
+        let output = self.run_shell_bash(&cmd).await?;
+        Ok(output.status.success())
+    }
+
+    async fn run_auth_login(&self, host_api_url: &str) -> Result<(), TerrariumError> {
+        // Remove any leftover auth container
+        let _ = self.run_nerdctl(None, &["rm", "-f", AUTH_CONTAINER]).await;
+
+        let repo_root = self.find_repo_root()?;
+        let host_open_mount = format!(
+            "{}:/usr/local/bin/host-open:ro",
+            repo_root.join("desktop/src-tauri/scripts/host-open").display()
+        );
+
+        let host_api_env = format!("TERRARIUM_HOST_API={}", host_api_url);
+
+        eprintln!("[auth] Starting claude auth login...");
+
+        // Run `claude auth login` in a container WITHOUT bind-mounting ~/.claude.
+        // The image's own ~/.claude/ (with settings.json) must exist for auth to
+        // write .credentials.json — an empty bind-mounted dir breaks it.
+        // We use a persistent container (not --rm) so we can copy credentials out.
+        let output = self
+            .run_nerdctl(
+                None,
+                &[
+                    "run", "-d",
+                    "--name", AUTH_CONTAINER,
+                    "--network", "host",
+                    "-v", &host_open_mount,
+                    "-e", &host_api_env,
+                    "-e", "BROWSER=/usr/local/bin/host-open",
+                    "--user", "terrarium",
+                    DEV_IMAGE,
+                    "sleep", "3600",
+                ],
+            )
+            .await?;
+
+        if !output.status.success() {
+            let _ = self.run_nerdctl(None, &["rm", "-f", AUTH_CONTAINER]).await;
+            return Err(TerrariumError::ContainerError {
+                message: format!(
+                    "Failed to start auth container: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            });
+        }
+
+        // Run auth login via exec
+        let login_output = self
+            .run_nerdctl(
+                None,
+                &[
+                    "exec",
+                    "-e", &host_api_env,
+                    "-e", "BROWSER=/usr/local/bin/host-open",
+                    "--user", "terrarium",
+                    AUTH_CONTAINER,
+                    "/home/terrarium/.local/bin/claude", "auth", "login",
+                ],
+            )
+            .await?;
+
+        let stdout = String::from_utf8_lossy(&login_output.stdout);
+        let stderr = String::from_utf8_lossy(&login_output.stderr);
+        eprintln!("[auth] exit status: {}", login_output.status);
+        eprintln!("[auth] stdout: {}", stdout.trim());
+        eprintln!("[auth] stderr: {}", stderr.trim());
+
+        if !login_output.status.success() {
+            let _ = self.run_nerdctl(None, &["rm", "-f", AUTH_CONTAINER]).await;
+            return Err(TerrariumError::ContainerError {
+                message: format!(
+                    "Auth login failed.\nstderr: {}\nstdout: {}",
+                    stderr.trim(),
+                    stdout.trim()
+                ),
+            });
+        }
+
+        // Copy .credentials.json from the container to the shared auth dir
+        self.ensure_auth_dir().await?;
+        let copy_output = self
+            .run_nerdctl(
+                None,
+                &[
+                    "exec", "--user", "terrarium",
+                    AUTH_CONTAINER,
+                    "cat", "/home/terrarium/.claude/.credentials.json",
+                ],
+            )
+            .await?;
+
+        if !copy_output.status.success() || copy_output.stdout.is_empty() {
+            let _ = self.run_nerdctl(None, &["rm", "-f", AUTH_CONTAINER]).await;
+            return Err(TerrariumError::ContainerError {
+                message: "Auth login succeeded but no credentials file was created".to_string(),
+            });
+        }
+
+        // Write credentials to the shared auth dir on the VM
+        let creds = String::from_utf8_lossy(&copy_output.stdout);
+        eprintln!("[auth] Got credentials, writing to shared auth dir...");
+        let write_cmd = format!(
+            "cat > {0}/.credentials.json && chown 1000:1000 {0}/.credentials.json",
+            AUTH_DIR
+        );
+        let mut cmd = self.limactl()?;
+        let mut child = cmd
+            .args(["shell", VM_NAME, "--", "sudo", "bash", "-c", &write_cmd])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| TerrariumError::Internal { message: e.to_string() })?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(creds.as_bytes()).await
+                .map_err(|e| TerrariumError::Internal {
+                    message: format!("Failed to write credentials: {}", e),
+                })?;
+        }
+
+        let write_result = child.wait().await
+            .map_err(|e| TerrariumError::Internal { message: e.to_string() })?;
+
+        if !write_result.success() {
+            let _ = self.run_nerdctl(None, &["rm", "-f", AUTH_CONTAINER]).await;
+            return Err(TerrariumError::Internal {
+                message: "Failed to write credentials to shared auth dir".to_string(),
+            });
+        }
+
+        // Clean up auth container
+        let _ = self.run_nerdctl(None, &["rm", "-f", AUTH_CONTAINER]).await;
+
+        eprintln!("[auth] Auth login complete, credentials saved.");
+        Ok(())
     }
 
     async fn dev_container_status(
