@@ -1,8 +1,6 @@
 pub mod lima;
 pub mod types;
 
-use std::path::PathBuf;
-
 use async_trait::async_trait;
 use types::{ContainerStatus, RuntimeStatus, VmStatus};
 
@@ -43,37 +41,16 @@ pub trait ContainerRuntime: Send + Sync {
     /// Load the dev base image into a project's namespace.
     async fn load_dev_image_into_namespace(&self, project_id: &str) -> Result<(), TerrariumError>;
 
-    /// Run the dev container in a project's namespace.
-    async fn run_dev_container(&self, project_id: &str) -> Result<(), TerrariumError>;
+    /// Run the dev container for a project, bind-mounting the workspace directory.
+    async fn run_dev_container(
+        &self,
+        project_id: &str,
+        workspace_path: &str,
+    ) -> Result<(), TerrariumError>;
 
     /// Remove the dev container from a project's namespace.
     async fn remove_dev_container(&self, project_id: &str) -> Result<(), TerrariumError>;
 
     /// Get the status of the dev container in a project's namespace.
     async fn dev_container_status(&self, project_id: &str) -> Result<ContainerStatus, TerrariumError>;
-
-    /// Check whether the dev container has any previous Claude Code sessions.
-    async fn has_claude_sessions(&self, project_id: &str) -> Result<bool, TerrariumError>;
-
-    /// Get the command (program + args) to open a terminal session in a project's dev container.
-    async fn terminal_command(&self, project_id: &str, host_api_url: &str, continue_session: bool) -> Result<(PathBuf, Vec<String>), TerrariumError>;
-
-    /// Get the host gateway IP as seen from inside the VM.
-    async fn host_gateway_ip(&self) -> Result<String, TerrariumError>;
-
-    /// Ensure the shared auth directory exists on the VM.
-    async fn ensure_auth_dir(&self) -> Result<(), TerrariumError>;
-
-    /// Check if shared auth credentials exist (beyond just settings.json).
-    async fn has_auth_credentials(&self) -> Result<bool, TerrariumError>;
-
-    /// Remove shared auth credentials (sign out).
-    async fn remove_auth_credentials(&self) -> Result<(), TerrariumError>;
-
-    /// Cancel an in-progress auth login by killing the auth container.
-    async fn cancel_auth_login(&self) -> Result<(), TerrariumError>;
-
-    /// Run `claude auth login` headlessly in a temporary auth container.
-    /// Opens the browser via host-open, waits for OAuth to complete.
-    async fn run_auth_login(&self, host_api_url: &str) -> Result<(), TerrariumError>;
 }

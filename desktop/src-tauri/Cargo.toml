@@ -27,7 +27,6 @@ chrono = "0.4"
 tokio = { version = "1", features = ["process", "sync", "fs"] }
 async-trait = "0.1"
 which = "7"
-portable-pty = "0.9"
-base64 = "0.22"
 axum = "0.7"
+dirs = "5"
 

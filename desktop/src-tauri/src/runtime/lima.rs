@@ -11,9 +11,6 @@ const DEV_IMAGE: &str = "terrarium/dev-base:latest";
 
 const VM_NAME: &str = "terrarium";
 
-const AUTH_DIR: &str = "/opt/terrarium/claude-auth";
-const AUTH_CONTAINER: &str = "terrarium-auth";
-
 pub struct LimaRuntime {
     limactl_path: Option<PathBuf>,
 }
@@ -21,7 +18,9 @@ pub struct LimaRuntime {
 impl LimaRuntime {
     pub fn new() -> Self {
         let limactl_path = Self::find_limactl();
-        Self { limactl_path }
+        Self {
+            limactl_path,
+        }
     }
 
     /// Find the limactl binary. Checks PATH first, then common Homebrew locations.
@@ -76,15 +75,17 @@ impl ContainerRuntime for LimaRuntime {
             Err(_) => return VmStatus::NotInstalled,
         };
 
-        let output = match cmd
-            .args(["list", "--json"])
-            .output()
-            .await
-        {
-            Ok(output) => output,
-            Err(e) => {
+        let future = cmd.args(["list", "--json"]).output();
+        let output = match tokio::time::timeout(std::time::Duration::from_secs(10), future).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => {
                 return VmStatus::Error {
                     message: e.to_string(),
+                }
+            }
+            Err(_) => {
+                return VmStatus::Error {
+                    message: "limactl list timed out after 10s".into(),
                 }
             }
         };
@@ -161,11 +162,15 @@ impl ContainerRuntime for LimaRuntime {
                 let yaml_path = self.find_vm_template()?;
 
                 let mut cmd = self.limactl()?;
-                let output = cmd
+                let future = cmd
                     .args(["create", "--name", VM_NAME, "--tty=false"])
                     .arg(&yaml_path)
-                    .output()
+                    .output();
+                let output = tokio::time::timeout(VM_TIMEOUT_LONG, future)
                     .await
+                    .map_err(|_| TerrariumError::VmStartFailed {
+                        message: "VM create timed out after 5 minutes".into(),
+                    })?
                     .map_err(|e| TerrariumError::VmStartFailed {
                         message: e.to_string(),
                     })?;
@@ -189,10 +194,14 @@ impl ContainerRuntime for LimaRuntime {
 
     async fn start_vm(&self) -> Result<(), TerrariumError> {
         let mut cmd = self.limactl()?;
-        let output = cmd
-            .args(["start", VM_NAME])
-            .output()
+        let future = cmd.args(["start", VM_NAME]).output();
+
+        // VM start can take a while but shouldn't take more than 2 minutes
+        let output = tokio::time::timeout(std::time::Duration::from_secs(120), future)
             .await
+            .map_err(|_| TerrariumError::VmStartFailed {
+                message: "VM start timed out after 120s".into(),
+            })?
             .map_err(|e| TerrariumError::VmStartFailed {
                 message: e.to_string(),
             })?;
@@ -208,10 +217,13 @@ impl ContainerRuntime for LimaRuntime {
 
     async fn stop_vm(&self) -> Result<(), TerrariumError> {
         let mut cmd = self.limactl()?;
-        let output = cmd
-            .args(["stop", VM_NAME])
-            .output()
+        let future = cmd.args(["stop", VM_NAME]).output();
+
+        let output = tokio::time::timeout(std::time::Duration::from_secs(60), future)
             .await
+            .map_err(|_| TerrariumError::LimaCommandFailed {
+                message: "VM stop timed out after 60s".into(),
+            })?
             .map_err(|e| TerrariumError::LimaCommandFailed {
                 message: e.to_string(),
             })?;
@@ -274,7 +286,7 @@ impl ContainerRuntime for LimaRuntime {
         let dockerfile_str = dockerfile_path.to_string_lossy();
 
         let output = self
-            .run_nerdctl(
+            .run_nerdctl_timeout(
                 None,
                 &[
                     "build",
@@ -284,6 +296,7 @@ impl ContainerRuntime for LimaRuntime {
                     &dockerfile_str,
                     &context_path,
                 ],
+                VM_TIMEOUT_LONG,
             )
             .await?;
 
@@ -302,7 +315,11 @@ impl ContainerRuntime for LimaRuntime {
         Ok(())
     }
 
-    async fn run_dev_container(&self, project_id: &str) -> Result<(), TerrariumError> {
+    async fn run_dev_container(
+        &self,
+        project_id: &str,
+        workspace_path: &str,
+    ) -> Result<(), TerrariumError> {
         let container = Self::container_name(project_id);
         let volume = Self::volume_name(project_id);
 
@@ -329,31 +346,20 @@ impl ContainerRuntime for LimaRuntime {
             }
         }
 
-        // Bind-mount frequently-changing files from the host repo so that
-        // edits are visible without rebuilding the dev image.
-        let repo_root = self.find_repo_root()?;
-        let mcp_mount = format!(
-            "{}:/opt/terrarium/mcp-server/terrarium-mcp.js:ro",
-            repo_root.join("mcp-server/dist/terrarium-mcp.js").display()
-        );
-        let terrarium_md_mount = format!(
-            "{}:/etc/terrarium/TERRARIUM.md:ro",
-            repo_root.join("desktop/src-tauri/TERRARIUM.md").display()
-        );
-        let host_open_mount = format!(
-            "{}:/usr/local/bin/host-open:ro",
-            repo_root.join("desktop/src-tauri/scripts/host-open").display()
+        // Bind-mount the host workspace directory into the container
+        let workspace_mount = format!(
+            "{}:/home/terrarium/workspace:rw",
+            workspace_path
         );
         let volume_mount = format!("{}:/home/terrarium/.claude", volume);
+
         let output = self
             .run_nerdctl(
                 None,
                 &[
                     "run", "-d", "--name", &container,
                     "-v", &volume_mount,
-                    "-v", &mcp_mount,
-                    "-v", &terrarium_md_mount,
-                    "-v", &host_open_mount,
+                    "-v", &workspace_mount,
                     DEV_IMAGE,
                 ],
             )
@@ -389,292 +395,6 @@ impl ContainerRuntime for LimaRuntime {
         Ok(())
     }
 
-    async fn has_claude_sessions(&self, project_id: &str) -> Result<bool, TerrariumError> {
-        let container = Self::container_name(project_id);
-        let output = self
-            .run_nerdctl(None, &[
-                "exec", "--user", "terrarium", &container,
-                "find", "/home/terrarium/.claude/projects",
-                "-name", "*.jsonl", "-print", "-quit",
-            ])
-            .await?;
-        if !output.status.success() {
-            return Ok(false); // directory doesn't exist = no sessions
-        }
-        Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
-    }
-
-    async fn terminal_command(&self, project_id: &str, host_api_url: &str, continue_session: bool) -> Result<(PathBuf, Vec<String>), TerrariumError> {
-        let limactl = self.limactl_path.clone().ok_or(TerrariumError::LimaNotInstalled)?;
-        let container = Self::container_name(project_id);
-
-        // Seed auth credentials into the dev container if they exist in the shared auth dir
-        // but are not yet present in the container
-        let seed_cmd = format!(
-            "test -f {auth}/.credentials.json && \
-             ! nerdctl exec --user terrarium {container} test -f /home/terrarium/.claude/.credentials.json 2>/dev/null && \
-             cat {auth}/.credentials.json | nerdctl exec -i --user terrarium {container} tee /home/terrarium/.claude/.credentials.json > /dev/null",
-            auth = AUTH_DIR,
-            container = container,
-        );
-        let _ = self.run_shell_bash(&seed_cmd).await;
-
-        let args = vec![
-            "shell".to_string(),
-            VM_NAME.to_string(),
-            "--".to_string(),
-            "sudo".to_string(),
-            "nerdctl".to_string(),
-            "exec".to_string(),
-            "-it".to_string(),
-            "-e".to_string(),
-            "TERM=xterm-256color".to_string(),
-            "-e".to_string(),
-            "LANG=C.UTF-8".to_string(),
-            "-e".to_string(),
-            format!("TERRARIUM_HOST_API={}", host_api_url),
-            "--user".to_string(),
-            "terrarium".to_string(),
-            "-w".to_string(),
-            "/home/terrarium/workspace".to_string(),
-            container,
-            "bash".to_string(),
-            "-lc".to_string(),
-            if continue_session {
-                "claude --continue".to_string()
-            } else {
-                "claude".to_string()
-            },
-        ];
-
-        Ok((limactl, args))
-    }
-
-    async fn host_gateway_ip(&self) -> Result<String, TerrariumError> {
-        let mut cmd = self.limactl()?;
-        let output = cmd
-            .args(["shell", VM_NAME, "--", "ip", "route", "show", "default"])
-            .output()
-            .await
-            .map_err(|e| TerrariumError::Internal {
-                message: format!("Failed to get gateway IP: {}", e),
-            })?;
-
-        if !output.status.success() {
-            return Err(TerrariumError::Internal {
-                message: format!(
-                    "ip route failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            });
-        }
-
-        // Parse "default via 192.168.64.1 dev enp0s1 ..."
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let ip = stdout
-            .split_whitespace()
-            .skip_while(|&w| w != "via")
-            .nth(1)
-            .ok_or_else(|| TerrariumError::Internal {
-                message: format!("Could not parse gateway IP from: {}", stdout.trim()),
-            })?
-            .to_string();
-
-        Ok(ip)
-    }
-
-    async fn ensure_auth_dir(&self) -> Result<(), TerrariumError> {
-        // Create the directory and chown to UID 1000 (terrarium user inside containers)
-        // so Claude Code can write auth credentials to the bind-mounted ~/.claude/
-        let cmd = format!("mkdir -p {} && chown 1000:1000 {}", AUTH_DIR, AUTH_DIR);
-        let output = self.run_shell_bash(&cmd).await?;
-
-        if !output.status.success() {
-            return Err(TerrariumError::Internal {
-                message: format!(
-                    "Failed to create auth dir: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            });
-        }
-
-        Ok(())
-    }
-
-    async fn has_auth_credentials(&self) -> Result<bool, TerrariumError> {
-        let cmd = format!("test -f {}/.credentials.json", AUTH_DIR);
-        let output = self.run_shell_bash(&cmd).await?;
-        Ok(output.status.success())
-    }
-
-    async fn remove_auth_credentials(&self) -> Result<(), TerrariumError> {
-        let cmd = format!("rm -f {}/.credentials.json", AUTH_DIR);
-        let output = self.run_shell_bash(&cmd).await?;
-
-        if !output.status.success() {
-            return Err(TerrariumError::Internal {
-                message: format!(
-                    "Failed to remove auth credentials: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            });
-        }
-
-        Ok(())
-    }
-
-    async fn cancel_auth_login(&self) -> Result<(), TerrariumError> {
-        let _ = self.run_nerdctl(None, &["rm", "-f", AUTH_CONTAINER]).await;
-        Ok(())
-    }
-
-    async fn run_auth_login(&self, host_api_url: &str) -> Result<(), TerrariumError> {
-        // Remove any leftover auth container
-        let _ = self.run_nerdctl(None, &["rm", "-f", AUTH_CONTAINER]).await;
-
-        let repo_root = self.find_repo_root()?;
-        let host_open_mount = format!(
-            "{}:/usr/local/bin/host-open:ro",
-            repo_root.join("desktop/src-tauri/scripts/host-open").display()
-        );
-
-        let host_api_env = format!("TERRARIUM_HOST_API={}", host_api_url);
-
-        eprintln!("[auth] Starting claude auth login...");
-
-        // Run `claude auth login` in a container WITHOUT bind-mounting ~/.claude.
-        // The image's own ~/.claude/ (with settings.json) must exist for auth to
-        // write .credentials.json — an empty bind-mounted dir breaks it.
-        // We use a persistent container (not --rm) so we can copy credentials out.
-        let output = self
-            .run_nerdctl(
-                None,
-                &[
-                    "run", "-d",
-                    "--name", AUTH_CONTAINER,
-                    "--network", "host",
-                    "-v", &host_open_mount,
-                    "-e", &host_api_env,
-                    "-e", "BROWSER=/usr/local/bin/host-open",
-                    "--user", "terrarium",
-                    DEV_IMAGE,
-                    "sleep", "3600",
-                ],
-            )
-            .await?;
-
-        if !output.status.success() {
-            let _ = self.run_nerdctl(None, &["rm", "-f", AUTH_CONTAINER]).await;
-            return Err(TerrariumError::ContainerError {
-                message: format!(
-                    "Failed to start auth container: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            });
-        }
-
-        // Run auth login via exec (with 3-minute timeout)
-        let login_args: Vec<&str> = vec![
-            "exec",
-            "-e", &host_api_env,
-            "-e", "BROWSER=/usr/local/bin/host-open",
-            "--user", "terrarium",
-            AUTH_CONTAINER,
-            "/home/terrarium/.local/bin/claude", "auth", "login",
-        ];
-        let login_future = self.run_nerdctl(None, &login_args);
-
-        let login_output = match tokio::time::timeout(
-            std::time::Duration::from_secs(180),
-            login_future,
-        ).await {
-            Ok(result) => result?,
-            Err(_) => {
-                let _ = self.run_nerdctl(None, &["rm", "-f", AUTH_CONTAINER]).await;
-                return Err(TerrariumError::ContainerError {
-                    message: "Auth login timed out after 3 minutes. Please try again.".to_string(),
-                });
-            }
-        };
-
-        let stdout = String::from_utf8_lossy(&login_output.stdout);
-        let stderr = String::from_utf8_lossy(&login_output.stderr);
-        eprintln!("[auth] exit status: {}", login_output.status);
-        eprintln!("[auth] stdout: {}", stdout.trim());
-        eprintln!("[auth] stderr: {}", stderr.trim());
-
-        if !login_output.status.success() {
-            let _ = self.run_nerdctl(None, &["rm", "-f", AUTH_CONTAINER]).await;
-            return Err(TerrariumError::ContainerError {
-                message: format!(
-                    "Auth login failed.\nstderr: {}\nstdout: {}",
-                    stderr.trim(),
-                    stdout.trim()
-                ),
-            });
-        }
-
-        // Copy .credentials.json from the container to the shared auth dir
-        self.ensure_auth_dir().await?;
-        let copy_output = self
-            .run_nerdctl(
-                None,
-                &[
-                    "exec", "--user", "terrarium",
-                    AUTH_CONTAINER,
-                    "cat", "/home/terrarium/.claude/.credentials.json",
-                ],
-            )
-            .await?;
-
-        if !copy_output.status.success() || copy_output.stdout.is_empty() {
-            let _ = self.run_nerdctl(None, &["rm", "-f", AUTH_CONTAINER]).await;
-            return Err(TerrariumError::ContainerError {
-                message: "Auth login succeeded but no credentials file was created".to_string(),
-            });
-        }
-
-        // Write credentials to the shared auth dir on the VM
-        let creds = String::from_utf8_lossy(&copy_output.stdout);
-        eprintln!("[auth] Got credentials, writing to shared auth dir...");
-        let write_cmd = format!(
-            "cat > {0}/.credentials.json && chown 1000:1000 {0}/.credentials.json",
-            AUTH_DIR
-        );
-        let mut cmd = self.limactl()?;
-        let mut child = cmd
-            .args(["shell", VM_NAME, "--", "sudo", "bash", "-c", &write_cmd])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| TerrariumError::Internal { message: e.to_string() })?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            stdin.write_all(creds.as_bytes()).await
-                .map_err(|e| TerrariumError::Internal {
-                    message: format!("Failed to write credentials: {}", e),
-                })?;
-        }
-
-        let write_result = child.wait().await
-            .map_err(|e| TerrariumError::Internal { message: e.to_string() })?;
-
-        if !write_result.success() {
-            let _ = self.run_nerdctl(None, &["rm", "-f", AUTH_CONTAINER]).await;
-            return Err(TerrariumError::Internal {
-                message: "Failed to write credentials to shared auth dir".to_string(),
-            });
-        }
-
-        // Clean up auth container
-        let _ = self.run_nerdctl(None, &["rm", "-f", AUTH_CONTAINER]).await;
-
-        eprintln!("[auth] Auth login complete, credentials saved.");
-        Ok(())
-    }
-
     async fn dev_container_status(
         &self,
         project_id: &str,
@@ -707,47 +427,49 @@ impl ContainerRuntime for LimaRuntime {
     }
 }
 
+/// Default timeout for VM commands (30 seconds).
+const VM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Longer timeout for image builds (5 minutes).
+const VM_TIMEOUT_LONG: std::time::Duration = std::time::Duration::from_secs(300);
+
 impl LimaRuntime {
-    /// Run a nerdctl command inside the VM, optionally in a specific namespace.
-    /// Returns the command output.
+    /// Run a nerdctl command inside the VM with a timeout.
+    /// Returns an error if the command doesn't complete in time (hung VM).
     async fn run_nerdctl(
         &self,
         namespace: Option<&str>,
         args: &[&str],
     ) -> Result<std::process::Output, TerrariumError> {
+        self.run_nerdctl_timeout(namespace, args, VM_TIMEOUT).await
+    }
+
+    /// Run a nerdctl command with a custom timeout (for long operations like image builds).
+    async fn run_nerdctl_timeout(
+        &self,
+        namespace: Option<&str>,
+        args: &[&str],
+        timeout: std::time::Duration,
+    ) -> Result<std::process::Output, TerrariumError> {
         let mut cmd = self.limactl()?;
         let mut shell_args = vec!["shell", VM_NAME, "--"];
 
-        // Build the nerdctl command with optional namespace
         let mut nerdctl_args = vec!["sudo", "nerdctl"];
         if let Some(ns) = namespace {
             nerdctl_args.push("--namespace");
             nerdctl_args.push(ns);
         }
         nerdctl_args.extend_from_slice(args);
-
         shell_args.extend_from_slice(&nerdctl_args);
 
-        cmd.args(&shell_args)
-            .output()
-            .await
-            .map_err(|e| TerrariumError::Internal {
+        let future = cmd.args(&shell_args).output();
+        match tokio::time::timeout(timeout, future).await {
+            Ok(result) => result.map_err(|e| TerrariumError::Internal {
                 message: e.to_string(),
-            })
-    }
-
-    /// Run a bash command inside the VM. Used for piped commands.
-    async fn run_shell_bash(
-        &self,
-        bash_cmd: &str,
-    ) -> Result<std::process::Output, TerrariumError> {
-        let mut cmd = self.limactl()?;
-        cmd.args(["shell", VM_NAME, "--", "sudo", "bash", "-c", bash_cmd])
-            .output()
-            .await
-            .map_err(|e| TerrariumError::Internal {
-                message: e.to_string(),
-            })
+            }),
+            Err(_) => Err(TerrariumError::Internal {
+                message: format!("VM command timed out after {}s", timeout.as_secs()),
+            }),
+        }
     }
 
     /// Find the path to Dockerfile.dev-base.
@@ -842,6 +564,69 @@ impl LimaRuntime {
 
         Err(TerrariumError::Internal {
             message: "Could not find lima-terrarium.yaml template".into(),
+        })
+    }
+
+    /// Find the built MCP server JS file.
+    pub fn find_mcp_server(&self) -> Result<PathBuf, TerrariumError> {
+        let repo_root = self.find_repo_root()?;
+        let mcp_path = repo_root.join("mcp-server/dist/terrarium-mcp.js");
+        if mcp_path.exists() {
+            return Ok(mcp_path);
+        }
+
+        // Also check next to executable for bundled app
+        let candidates = [
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("terrarium-mcp.js"))),
+            std::env::current_exe().ok().and_then(|p| {
+                p.parent()
+                    .and_then(|d| d.parent())
+                    .map(|d| d.join("Resources").join("terrarium-mcp.js"))
+            }),
+        ];
+
+        for candidate in candidates.iter().flatten() {
+            if candidate.exists() {
+                return Ok(candidate.clone());
+            }
+        }
+
+        Err(TerrariumError::Internal {
+            message: "Could not find terrarium-mcp.js. Run `npm run build` in mcp-server/".into(),
+        })
+    }
+
+    /// Find the hooks directory containing terrarium-proxy.sh.
+    pub fn find_hooks_dir(&self) -> Result<PathBuf, TerrariumError> {
+        let candidates = [
+            // Development: next to Cargo.toml (running from src-tauri/)
+            std::env::current_dir().ok().map(|d| d.join("hooks")),
+            // Development: src-tauri directory (running from desktop/)
+            std::env::current_dir()
+                .ok()
+                .map(|d| d.join("src-tauri").join("hooks")),
+            // Next to the executable (bundled app)
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("hooks"))),
+            // Tauri resource directory
+            std::env::current_exe().ok().and_then(|p| {
+                p.parent()
+                    .and_then(|d| d.parent())
+                    .map(|d| d.join("Resources").join("hooks"))
+            }),
+        ];
+
+        for candidate in candidates.iter().flatten() {
+            if candidate.join("terrarium-proxy.sh").exists() {
+                return Ok(candidate.clone());
+            }
+        }
+
+        Err(TerrariumError::Internal {
+            message: "Could not find hooks directory".into(),
         })
     }
 }

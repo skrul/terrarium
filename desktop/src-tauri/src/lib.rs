@@ -2,26 +2,22 @@ mod error;
 mod host_api;
 mod project;
 mod runtime;
-mod terminal;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use project::{Project, ProjectStatus};
 use runtime::lima::LimaRuntime;
 use runtime::types::{RuntimeStatus, VmStatus};
 use runtime::ContainerRuntime;
-use terminal::TerminalManager;
 use tokio::sync::Mutex;
 
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
-use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::State;
 use uuid::Uuid;
 
 pub struct AppState {
     projects: Mutex<Vec<Project>>,
-    runtime: Arc<dyn ContainerRuntime>,
-    terminals: TerminalManager,
+    runtime: Arc<LimaRuntime>,
     host_api_port: u16,
 }
 
@@ -30,9 +26,128 @@ impl AppState {
         Self {
             projects: Mutex::new(Vec::new()),
             runtime: Arc::new(LimaRuntime::new()),
-            terminals: TerminalManager::new(),
             host_api_port,
         }
+    }
+}
+
+/// Get the base directory for all Terrarium project workspaces.
+fn terrarium_base_dir() -> PathBuf {
+    dirs::home_dir()
+        .expect("Could not determine home directory")
+        .join("Terrarium")
+}
+
+/// Create the workspace directory and config files for a new project.
+fn setup_workspace(
+    project_id: &str,
+    project_name: &str,
+    container_name: &str,
+    hooks_dir: &PathBuf,
+    mcp_server_path: &PathBuf,
+) -> Result<PathBuf, String> {
+    let workspace = terrarium_base_dir().join(project_name);
+
+    // Create directories
+    std::fs::create_dir_all(workspace.join(".terrarium"))
+        .map_err(|e| format!("Failed to create .terrarium dir: {}", e))?;
+    std::fs::create_dir_all(workspace.join(".claude"))
+        .map_err(|e| format!("Failed to create .claude dir: {}", e))?;
+
+    // Write .terrarium/config.json
+    let terrarium_config = serde_json::json!({
+        "project_id": project_id,
+        "container_name": container_name,
+        "created_at": chrono::Utc::now().to_rfc3339(),
+    });
+    std::fs::write(
+        workspace.join(".terrarium/config.json"),
+        serde_json::to_string_pretty(&terrarium_config).unwrap(),
+    )
+    .map_err(|e| format!("Failed to write .terrarium/config.json: {}", e))?;
+
+    // Write .claude/settings.json with hooks and permissions
+    let hook_script = hooks_dir.join("terrarium-proxy.sh");
+    let claude_settings = serde_json::json!({
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": hook_script.to_string_lossy()
+                }]
+            }]
+        },
+        "permissions": {
+            "allow": [
+                "Bash(*)",
+                "Read(*)",
+                "Write(*)",
+                "Edit(*)",
+                "mcp__terrarium(*)"
+            ]
+        }
+    });
+    std::fs::write(
+        workspace.join(".claude/settings.json"),
+        serde_json::to_string_pretty(&claude_settings).unwrap(),
+    )
+    .map_err(|e| format!("Failed to write .claude/settings.json: {}", e))?;
+
+    // Write .mcp.json at project root (Claude Code reads MCP servers from here)
+    let mcp_config = serde_json::json!({
+        "mcpServers": {
+            "terrarium": {
+                "command": "node",
+                "args": [mcp_server_path.to_string_lossy()],
+                "env": {
+                    "TERRARIUM_HOST_API": format!("http://localhost:{}", HOST_API_PORT),
+                    "TERRARIUM_PROJECT_ID": project_id
+                }
+            }
+        }
+    });
+    std::fs::write(
+        workspace.join(".mcp.json"),
+        serde_json::to_string_pretty(&mcp_config).unwrap(),
+    )
+    .map_err(|e| format!("Failed to write .mcp.json: {}", e))?;
+
+    // Write .claude/settings.local.json to pre-approve MCP servers
+    let settings_local = serde_json::json!({
+        "enableAllProjectMcpServers": true
+    });
+    std::fs::write(
+        workspace.join(".claude/settings.local.json"),
+        serde_json::to_string_pretty(&settings_local).unwrap(),
+    )
+    .map_err(|e| format!("Failed to write .claude/settings.local.json: {}", e))?;
+
+    // Write .claude/CLAUDE.md
+    let claude_md = format!(
+        "# {name}\n\n\
+         This is a Terrarium project. Your development environment runs inside a sandboxed container.\n\n\
+         ## How it works\n\n\
+         - **File operations** (read, write, edit, search) work directly on this directory.\n\
+         - **Shell commands** (bash) are automatically proxied into your dev container.\n\
+         - The container has Node.js, Python, and common dev tools pre-installed.\n\n\
+         ## Tips\n\n\
+         - Run `node -v` or `python3 --version` to verify the container environment.\n\
+         - Files you create here are immediately visible inside the container.\n\
+         - Use `ls /` to explore the container filesystem.\n",
+        name = project_name,
+    );
+    std::fs::write(workspace.join(".claude/CLAUDE.md"), claude_md)
+        .map_err(|e| format!("Failed to write .claude/CLAUDE.md: {}", e))?;
+
+    Ok(workspace)
+}
+
+/// Delete the workspace directory for a project.
+fn remove_workspace(workspace_path: &str) {
+    let path = PathBuf::from(workspace_path);
+    if path.exists() {
+        let _ = std::fs::remove_dir_all(&path);
     }
 }
 
@@ -44,6 +159,21 @@ async fn list_projects(state: State<'_, AppState>) -> Result<Vec<Project>, Strin
 #[tauri::command]
 async fn create_project(name: String, state: State<'_, AppState>) -> Result<Project, String> {
     let id = Uuid::new_v4().to_string();
+    let container_name = format!("terrarium-{}-dev", &id);
+
+    // Find hooks directory and MCP server
+    let hooks_dir = state
+        .runtime
+        .find_hooks_dir()
+        .map_err(|e| e.to_string())?;
+    let mcp_server_path = state
+        .runtime
+        .find_mcp_server()
+        .map_err(|e| e.to_string())?;
+
+    // Create workspace directory with config files
+    let workspace_path = setup_workspace(&id, &name, &container_name, &hooks_dir, &mcp_server_path)?;
+    let workspace_str = workspace_path.to_string_lossy().to_string();
 
     // Insert project in Creating state
     let project = Project {
@@ -51,6 +181,7 @@ async fn create_project(name: String, state: State<'_, AppState>) -> Result<Proj
         name,
         status: ProjectStatus::Creating,
         created_at: chrono::Utc::now().to_rfc3339(),
+        workspace_path: workspace_str.clone(),
     };
     state.projects.lock().await.push(project.clone());
 
@@ -89,8 +220,8 @@ async fn create_project(name: String, state: State<'_, AppState>) -> Result<Proj
         return Err(e.to_string());
     }
 
-    // Run the dev container
-    if let Err(e) = state.runtime.run_dev_container(&id).await {
+    // Run the dev container with workspace bind-mount
+    if let Err(e) = state.runtime.run_dev_container(&id, &workspace_str).await {
         let mut projects = state.projects.lock().await;
         if let Some(p) = projects.iter_mut().find(|p| p.id == id) {
             p.status = ProjectStatus::Error;
@@ -110,14 +241,25 @@ async fn create_project(name: String, state: State<'_, AppState>) -> Result<Proj
 
 #[tauri::command]
 async fn delete_project(id: String, state: State<'_, AppState>) -> Result<(), String> {
-    // Close any terminal session for this project
-    state.terminals.close(&id).await;
+    // Get workspace path before removing from list
+    let workspace_path = {
+        let projects = state.projects.lock().await;
+        projects
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.workspace_path.clone())
+    };
 
     // Remove dev container first (best effort — VM might not be running)
     let _ = state.runtime.remove_dev_container(&id).await;
 
     // Then delete the namespace
     let _ = state.runtime.delete_namespace(&id).await;
+
+    // Remove workspace directory
+    if let Some(path) = workspace_path {
+        remove_workspace(&path);
+    }
 
     state.projects.lock().await.retain(|p| p.id != id);
     Ok(())
@@ -147,220 +289,28 @@ async fn stop_vm(state: State<'_, AppState>) -> Result<(), String> {
     state.runtime.stop_vm().await.map_err(|e| e.to_string())
 }
 
-/// Check if global Claude Code auth credentials exist.
+/// Open a project's workspace directory in the default terminal.
 #[tauri::command]
-async fn check_auth_status(state: State<'_, AppState>) -> Result<bool, String> {
-    state
-        .runtime
-        .has_auth_credentials()
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Run the OAuth flow headlessly: starts auth container, runs `claude auth login`,
-/// opens browser via host-open, waits for completion.
-#[tauri::command]
-async fn start_oauth_flow(state: State<'_, AppState>) -> Result<(), String> {
-    // Ensure VM is ready
-    state
-        .runtime
-        .ensure_vm_ready()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Ensure dev image is built
-    state
-        .runtime
-        .ensure_dev_image()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Ensure auth directory exists on VM
-    state
-        .runtime
-        .ensure_auth_dir()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Determine the host API URL as seen from inside the VM
-    let gateway_ip = state
-        .runtime
-        .host_gateway_ip()
-        .await
-        .map_err(|e| e.to_string())?;
-    let host_api_url = format!("http://{}:{}", gateway_ip, state.host_api_port);
-
-    // Run claude auth login headlessly
-    state
-        .runtime
-        .run_auth_login(&host_api_url)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
-}
-
-/// Cancel an in-progress OAuth flow by killing the auth container.
-#[tauri::command]
-async fn cancel_oauth_flow(state: State<'_, AppState>) -> Result<(), String> {
-    state
-        .runtime
-        .cancel_auth_login()
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Remove shared auth credentials (sign out of Claude Code).
-#[tauri::command]
-async fn sign_out(state: State<'_, AppState>) -> Result<(), String> {
-    state
-        .runtime
-        .remove_auth_credentials()
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Called from the dashboard to create/focus the terminal window.
-/// Does NOT start the PTY — that happens when TerminalView calls start_terminal.
-#[tauri::command]
-async fn open_terminal(
-    project_id: String,
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
-    // Verify project exists and is Running
-    {
+async fn open_in_terminal(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let workspace_path = {
         let projects = state.projects.lock().await;
         let project = projects
             .iter()
-            .find(|p| p.id == project_id)
-            .ok_or_else(|| format!("Project not found: {}", project_id))?;
+            .find(|p| p.id == id)
+            .ok_or_else(|| format!("Project not found: {}", id))?;
+        project.workspace_path.clone()
+    };
 
-        if project.status != ProjectStatus::Running {
-            return Err(format!(
-                "Project is not running (status: {:?})",
-                project.status
-            ));
-        }
-    }
-
-    let window_label = format!("terminal-{}", project_id);
-
-    // If the window already exists, focus it
-    if let Some(window) = app.get_webview_window(&window_label) {
-        let _ = window.set_focus();
-        return Ok(());
-    }
-
-    // Create a new terminal window
-    let url = format!("#/terminal/{}", project_id);
-    let _window = WebviewWindowBuilder::new(&app, &window_label, WebviewUrl::App(url.into()))
-        .title("Terrarium — Terminal".to_string())
-        .inner_size(800.0, 600.0)
-        .build()
-        .map_err(|e| format!("Failed to create terminal window: {}", e))?;
+    // Use macOS `open -a Terminal <path>` to open a new terminal window at the workspace
+    std::process::Command::new("open")
+        .args(["-a", "Terminal", &workspace_path])
+        .status()
+        .map_err(|e| format!("Failed to open terminal: {}", e))?;
 
     Ok(())
 }
 
-/// Check whether a project's dev container has previous Claude Code sessions.
-#[tauri::command]
-async fn check_claude_sessions(
-    project_id: String,
-    state: State<'_, AppState>,
-) -> Result<bool, String> {
-    state.runtime.has_claude_sessions(&project_id).await.map_err(|e| e.to_string())
-}
 
-/// Called from TerminalView after event listeners are set up.
-/// Starts (or reattaches to) the PTY session.
-#[tauri::command]
-async fn start_terminal(
-    project_id: String,
-    continue_session: bool,
-    cols: u16,
-    rows: u16,
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
-    let window_label = format!("terminal-{}", project_id);
-
-    // If session already exists (e.g. window reopened), clean it up first
-    if state.terminals.has_session(&project_id).await {
-        state.terminals.close(&project_id).await;
-    }
-
-    // Determine the host API URL as seen from inside the VM
-    let gateway_ip = state
-        .runtime
-        .host_gateway_ip()
-        .await
-        .map_err(|e| e.to_string())?;
-    let host_api_url = format!("http://{}:{}", gateway_ip, state.host_api_port);
-
-    // Get the terminal command from the runtime
-    let (program, args) = state
-        .runtime
-        .terminal_command(&project_id, &host_api_url, continue_session)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Open the PTY session
-    state
-        .terminals
-        .open(
-            &project_id,
-            program,
-            args,
-            cols,
-            rows,
-            app.clone(),
-            window_label,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
-}
-
-#[tauri::command]
-async fn write_terminal(
-    session_id: String,
-    data: String,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
-    let bytes = BASE64
-        .decode(&data)
-        .map_err(|e| format!("Invalid base64: {}", e))?;
-
-    state
-        .terminals
-        .write(&session_id, &bytes)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn resize_terminal(
-    session_id: String,
-    cols: u16,
-    rows: u16,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
-    state
-        .terminals
-        .resize(&session_id, cols, rows)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn close_terminal(session_id: String, state: State<'_, AppState>) -> Result<(), String> {
-    state.terminals.close(&session_id).await;
-    Ok(())
-}
-
-use tauri::AppHandle;
 
 const HOST_API_PORT: u16 = 7778;
 
@@ -376,18 +326,40 @@ pub fn run() {
             get_vm_status,
             start_vm,
             stop_vm,
-            check_auth_status,
-            start_oauth_flow,
-            cancel_oauth_flow,
-            sign_out,
-            open_terminal,
-            check_claude_sessions,
-            start_terminal,
-            write_terminal,
-            resize_terminal,
-            close_terminal,
+            open_in_terminal,
         ])
         .setup(|app| {
+            use tauri::Manager;
+            use tauri::menu::{MenuBuilder, SubmenuBuilder, PredefinedMenuItem};
+
+            // Build native macOS menu
+            let app_submenu = SubmenuBuilder::new(app, "Terrarium")
+                .item(&PredefinedMenuItem::about(app, Some("About Terrarium"), None)?)
+                .separator()
+                .item(&PredefinedMenuItem::hide(app, Some("Hide Terrarium"))?)
+                .item(&PredefinedMenuItem::hide_others(app, Some("Hide Others"))?)
+                .item(&PredefinedMenuItem::show_all(app, Some("Show All"))?)
+                .separator()
+                .item(&PredefinedMenuItem::quit(app, Some("Quit Terrarium"))?)
+                .build()?;
+
+            let edit_submenu = SubmenuBuilder::new(app, "Edit")
+                .item(&PredefinedMenuItem::undo(app, None)?)
+                .item(&PredefinedMenuItem::redo(app, None)?)
+                .separator()
+                .item(&PredefinedMenuItem::cut(app, None)?)
+                .item(&PredefinedMenuItem::copy(app, None)?)
+                .item(&PredefinedMenuItem::paste(app, None)?)
+                .item(&PredefinedMenuItem::select_all(app, None)?)
+                .build()?;
+
+            let menu = MenuBuilder::new(app)
+                .item(&app_submenu)
+                .item(&edit_submenu)
+                .build()?;
+
+            app.set_menu(menu)?;
+
             // Start host API server (synchronously block to get the port)
             let host_api_port = tauri::async_runtime::block_on(async {
                 host_api::start(HOST_API_PORT).await
@@ -396,6 +368,12 @@ pub fn run() {
                 eprintln!("Failed to start host API: {}", e);
                 Box::<dyn std::error::Error>::from(e)
             })?;
+
+            // Ensure ~/Terrarium base directory exists
+            let base = terrarium_base_dir();
+            if let Err(e) = std::fs::create_dir_all(&base) {
+                eprintln!("Failed to create ~/Terrarium: {}", e);
+            }
 
             let app_state = AppState::new(host_api_port);
             app.manage(app_state);
@@ -412,19 +390,6 @@ pub fn run() {
             });
 
             Ok(())
-        })
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::Destroyed = event {
-                let label = window.label().to_string();
-                if let Some(project_id) = label.strip_prefix("terminal-") {
-                    let project_id = project_id.to_string();
-                    let app = window.app_handle().clone();
-                    tauri::async_runtime::spawn(async move {
-                        let state = app.state::<AppState>();
-                        state.terminals.close(&project_id).await;
-                    });
-                }
-            }
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

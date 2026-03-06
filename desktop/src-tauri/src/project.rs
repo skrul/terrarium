@@ -15,4 +15,5 @@ pub struct Project {
     pub name: String,
     pub status: ProjectStatus,
     pub created_at: String,
+    pub workspace_path: String,
 }

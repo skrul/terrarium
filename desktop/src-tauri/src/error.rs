@@ -11,7 +11,6 @@ pub enum TerrariumError {
     ImageBuildFailed { message: String },
     ContainerError { message: String },
     ProjectNotFound { id: String },
-    TerminalError { message: String },
     Internal { message: String },
 }
 
@@ -40,9 +39,6 @@ impl fmt::Display for TerrariumError {
             }
             TerrariumError::ProjectNotFound { id } => {
                 write!(f, "Project not found: {}", id)
-            }
-            TerrariumError::TerminalError { message } => {
-                write!(f, "Terminal error: {}", message)
             }
             TerrariumError::Internal { message } => write!(f, "Internal error: {}", message),
         }

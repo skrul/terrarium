@@ -5,4 +5,5 @@ export interface Project {
   name: string;
   status: ProjectStatus;
   created_at: string;
+  workspace_path: string;
 }

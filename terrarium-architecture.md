@@ -2,7 +2,7 @@
 
 *A safe little world for your creations.*
 
-**Version:** 0.1 (Draft)
+**Version:** 0.2
 **Date:** March 2026
 
 ---
@@ -28,50 +28,59 @@ The core metaphor: each project is a sealed terrarium — a self-contained littl
 ## 2. High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                  Terrarium Desktop App               │
-│               (macOS native — Swift/AppKit)           │
-│                                                       │
-│  ┌──────────┐  ┌──────────┐  ┌────────────────────┐  │
-│  │ Project  │  │ Resource │  │   Reverse Proxy    │  │
-│  │ Manager  │  │ Manager  │  │  (*.terrarium.local)│  │
-│  └────┬─────┘  └────┬─────┘  └────────┬───────────┘  │
-│       │              │                 │               │
-│  ┌────┴──────────────┴─────────────────┴───────────┐  │
-│  │              Container Runtime                   │  │
-│  │       (Lima + containerd, Apple VZ backend)      │  │
-│  │                                                   │  │
-│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐            │  │
-│  │  │ Project │ │ Project │ │ Project │  ...        │  │
-│  │  │   Dev   │ │  Deploy │ │   Dev   │            │  │
-│  │  │ (+ CC)  │ │ (pinned)│ │ (+ CC)  │            │  │
-│  │  └─────────┘ └─────────┘ └─────────┘            │  │
-│  └──────────────────────────────────────────────────┘  │
-│                                                       │
-│  ┌──────────────────────────────────────────────────┐  │
-│  │              MCP Server (per project)             │  │
-│  │  Tools: resources, logs, ui, ports, secrets ...  │  │
-│  └──────────────────────────────────────────────────┘  │
-│                                                       │
-│  ┌─────────────┐  ┌──────────┐  ┌─────────────────┐  │
-│  │   Secret    │  │  Deploy  │  │   Audit Log     │  │
-│  │   Proxy     │  │  Engine  │  │                  │  │
-│  └─────────────┘  └──────────┘  └─────────────────┘  │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────┐
+│ Terrarium Desktop App (Tauri)           │
+│  • Project lifecycle management         │
+│  • Lima VM management                   │
+│  • Container create/start/stop          │
+│  • Workspace directory setup            │
+│  • .claude/settings.json generation     │
+│  • Host API server (port 7778)          │
+└──────────────┬──────────────────────────┘
+               │ creates workspace at
+               │ ~/Terrarium/<project>/
+               │
+┌──────────────▼──────────────────────────┐
+│ Host Filesystem                          │
+│ ~/Terrarium/<project>/                   │
+│  ├── .claude/settings.json  (hooks)     │
+│  ├── .claude/CLAUDE.md                  │
+│  ├── .terrarium/config.json             │
+│  ├── .mcp.json                          │
+│  └── <user's project files>            │
+└──────────────┬──────────────────────────┘
+               │ virtiofs (writable)
+┌──────────────▼──────────────────────────┐
+│ Lima VM                                  │
+│  └── Container                           │
+│       /home/terrarium/workspace/         │
+│       (bind-mount from host dir)         │
+│       • Node.js, Python, etc.           │
+└──────────────────────────────────────────┘
+
+Claude Code (Desktop app or CLI)
+  • User opens ~/Terrarium/<project>/
+  • File ops work directly (shared fs)
+  • Bash commands proxied via hook →
+    limactl shell → nerdctl exec → container
+  • MCP server runs on host as stdio
+    subprocess, talks to Terrarium app
+    via host API (port 7778)
 ```
 
 ### Component Summary
 
 | Component | Responsibility |
 |---|---|
-| **Project Manager** | CRUD for projects. Owns the project manifest (name, state, resource declarations). Manages project lifecycle (create, start, stop, archive). |
+| **Project Manager** | CRUD for projects. Creates workspace directories at `~/Terrarium/<name>/` with hooks, MCP config, and project metadata. Manages project lifecycle (create, start, stop, delete). |
 | **Resource Manager** | Translates resource declarations from the manifest into container configuration. Handles ports, volumes, sidecar containers, memory limits, cron jobs, etc. |
-| **Container Runtime** | Lima with containerd/nerdctl on Apple's Virtualization.framework. Runs a shared VM with per-project containerd namespaces. Manages container groups (dev container + sidecars), networking between containers, and image builds. |
-| **Reverse Proxy** | Routes `*.terrarium.local` hostnames to the correct container port. Handles TLS termination with a local CA. Supports both desktop and LAN access. |
-| **MCP Server** | One instance per project, running inside the dev container alongside Claude Code. Exposes tools that let Claude Code declare resources, stream logs, configure the project UI, and trigger deployments. Communicates with the desktop app's Resource Manager via a host-side socket. Not present in deploy containers. |
-| **Secret Proxy** | Intercepts outbound HTTP(S) from containers and substitutes placeholder tokens with real secrets. Secrets never exist inside the container filesystem or environment. |
-| **Deploy Engine** | Builds OCI images from project state, pushes to local or remote targets. Handles local deploy (run alongside dev), remote deploy (push to another Terrarium instance), and cloud deploy (push to a cloud provider). |
-| **Audit Log** | Records every MCP call, resource allocation, port opening, and deployment. Queryable from the UI. Useful for debugging and security review. |
+| **Container Runtime** | Lima with containerd/nerdctl on Apple's Virtualization.framework. Runs a shared VM. Manages dev containers with workspace bind-mounts, image builds, and container lifecycle. |
+| **Reverse Proxy** | Routes `*.terrarium.local` hostnames to the correct container port. Handles TLS termination with a local CA. Supports both desktop and LAN access. *(Future)* |
+| **MCP Server** | Runs on the **host** as a stdio subprocess of Claude Code (configured in `.mcp.json`). Exposes tools that let Claude Code declare resources, stream logs, configure the project UI, and trigger deployments. Communicates with the Terrarium desktop app via the host API (HTTP on port 7778). Not present in deploy containers. |
+| **Hook Script** | `terrarium-proxy.sh` — a `PreToolUse` hook that intercepts Bash commands and rewrites them to execute inside the dev container via `limactl shell → nerdctl exec`. This is the core mechanism that makes Claude Code's shell commands run in the sandbox. |
+| **Secret Proxy** | Intercepts outbound HTTP(S) from containers and substitutes placeholder tokens with real secrets. Secrets never exist inside the container filesystem or environment. *(Future)* |
+| **Deploy Engine** | Builds OCI images from project state, pushes to local or remote targets. *(Future)* |
+| **Audit Log** | Records every MCP call, resource allocation, port opening, and deployment. *(Future)* |
 
 ---
 
@@ -226,27 +235,27 @@ deploy:
 
 1. User clicks "New Project" in the desktop app.
 2. User provides a name (editable later).
-3. Terrarium creates a project manifest with defaults.
-4. Terrarium provisions a dev container group:
-   - Minimal base dev image with: git, curl, and basic build essentials. Language runtimes (Node, Python, etc.) are installed by Claude Code as needed.
-   - Claude Code pre-installed and configured.
-   - The Terrarium MCP server pre-configured and connected to the desktop app.
-   - A `TERRARIUM.md` file at `/etc/terrarium/TERRARIUM.md` (part of the base image) that describes the environment and available MCP tools.
-5. The project appears in the dashboard in "Ready" state.
+3. Terrarium creates the project workspace at `~/Terrarium/<name>/`:
+   - `.claude/settings.json` — hooks configuration (Bash proxy) and auto-approved permissions.
+   - `.claude/settings.local.json` — pre-approves MCP servers so no prompt appears.
+   - `.claude/CLAUDE.md` — project-level instructions for Claude Code.
+   - `.terrarium/config.json` — project ID, container name, creation timestamp.
+   - `.mcp.json` — configures the Terrarium MCP server as a stdio subprocess.
+4. Terrarium ensures the Lima VM is running and the dev base image is built.
+5. Terrarium creates and starts a dev container with a writable bind-mount from the host workspace (`~/Terrarium/<name>/`) to `/home/terrarium/workspace/` inside the container.
+6. The project appears in the dashboard in "Running" state.
 
 ### 4.3 Working in a Project
 
-1. User clicks "Open Claude Code" on the project card.
-2. Terrarium opens a terminal window attached to a Claude Code session running inside the dev container. The session is persistent — closing and reopening the window reconnects to the same session (using tmux or similar under the hood).
-3. The user prompts Claude Code to build their app.
-4. Claude Code reads `TERRARIUM.md` to understand available MCP tools and best practices, then calls `terrarium.env.info` to get the current project state.
-5. As Claude Code builds, it uses MCP tools to request resources:
+1. User clicks "Open Terminal" on the project card. This opens a new Terminal.app window at `~/Terrarium/<name>/`.
+2. The user launches Claude Code (CLI: `claude`, or opens the directory in Claude Code Desktop).
+3. Claude Code reads `.claude/CLAUDE.md` and discovers the Terrarium MCP server via `.mcp.json`.
+4. **File operations** (Read, Write, Edit, Glob, Grep) work directly on the host filesystem. Changes are immediately visible inside the container via virtiofs.
+5. **Bash commands** are transparently proxied into the container by the `PreToolUse` hook. Claude Code doesn't know it's running in a sandbox — the hook rewrites every shell command to execute via `limactl shell → nerdctl exec`.
+6. As Claude Code builds, it can use MCP tools to request resources:
    - "I need a PostgreSQL database" → MCP call to add a sidecar container.
-   - "The app runs on port 3000" → MCP call to allocate a named port with a hostname.
-   - "Let me set up logging" → MCP call to create log sinks.
-   - "The user should be able to start and stop the dev server" → MCP call to register UI actions.
-6. Each MCP call updates the project manifest. The Resource Manager reconciles the manifest with the running container group (adding/removing containers, ports, volumes, etc.).
-7. The user sees their project UI update in real time: new action buttons appear, log streams light up, the app becomes accessible at `myapp.terrarium.local`.
+   - "The app runs on port 3000" → MCP call to allocate a named port.
+7. Each MCP call communicates with the Terrarium desktop app via the host API, which updates the project manifest and reconciles with the running container.
 
 ### 4.4 Project States
 
@@ -270,9 +279,11 @@ deploy:
 
 ## 5. MCP Server
 
-The MCP server is the primary interface between Claude Code and Terrarium. One MCP server instance runs per project, inside the dev container alongside Claude Code. It exposes a set of tools that Claude Code calls to declare resources, configure the project, and interact with the desktop app.
+The MCP server is the primary interface between Claude Code and Terrarium. It runs on the **host** as a stdio subprocess of Claude Code, configured in each project's `.mcp.json` file. This means it starts automatically when Claude Code opens a Terrarium project directory.
 
-The MCP server communicates with the desktop app's Resource Manager via a well-known socket or port on the host. This channel is how resource requests (add a container, allocate a port) make it from the container to the host-side management layer. Note that the MCP server is only present in dev containers — deployed containers have no MCP server and cannot request resource changes.
+The MCP server communicates with the Terrarium desktop app via the host API (HTTP on port 7778). This is how resource requests (add a container, allocate a port) flow from Claude Code → MCP server → Terrarium app → container runtime. The MCP server receives the project ID via the `TERRARIUM_PROJECT_ID` environment variable and the host API URL via `TERRARIUM_HOST_API`.
+
+Note that the MCP server is only present in dev workflows — deployed containers have no MCP server and cannot request resource changes.
 
 ### 5.1 Tool Categories
 
@@ -354,19 +365,16 @@ Some MCP calls require user approval before taking effect. These are actions tha
 
 When Claude Code makes one of these calls, the MCP server sends a request to the desktop app, which shows a confirmation dialog to the user. The MCP call blocks until the user approves or denies. Claude Code receives the result and can proceed or adjust accordingly.
 
-### 5.3 The TERRARIUM.md File
+### 5.3 The Project CLAUDE.md File
 
-This is a static file baked into the dev base image at `/etc/terrarium/TERRARIUM.md`. It serves as Claude Code's orientation document — the first thing it should read to understand where it is and what it can do. The file is updated only with Terrarium releases, not per-project.
+Each project workspace includes a `.claude/CLAUDE.md` file that serves as Claude Code's orientation document. It is generated by Terrarium during project creation and describes:
 
-Contents include:
+- That this is a Terrarium project with a sandboxed container environment.
+- How file operations work directly on the host while shell commands are proxied into the container.
+- What dev tools are available in the container (Node.js, Python, etc.).
+- Tips for verifying the container environment.
 
-- A description of the Terrarium environment and what it provides.
-- A catalog of all available MCP tools with descriptions and example calls.
-- Instructions to call `terrarium.env.info` to get live project state (current resources, ports, containers, volumes, UI configuration, etc.).
-- Best practices for building apps in this environment (e.g., "use placeholder tokens for secrets, don't hardcode ports, write logs to named sinks").
-- A reminder that this file is read-only and managed by Terrarium.
-
-Note that `TERRARIUM.md` does **not** contain live project state. All dynamic information (allocated resources, current configuration) is accessed through MCP calls, keeping a clean separation between "how the system works" (static) and "what's currently happening" (dynamic).
+The file does **not** contain live project state. All dynamic information (allocated resources, current configuration) is accessed through MCP calls, keeping a clean separation between "how the system works" (static) and "what's currently happening" (dynamic).
 
 ---
 
@@ -524,7 +532,7 @@ We assume:
 
 This is the core architectural security decision. Rather than trying to fully harden a dev container that inherently needs broad capabilities (Claude Code, MCP, package managers, build tools), we accept that dev containers have a larger attack surface and compensate by strictly limiting their exposure. Security is enforced at the deployment boundary.
 
-**Dev containers** are optimized for building. They contain Claude Code, the MCP server, dev tools, and broad egress access to package registries. They are inherently more permissive and are **never exposed to the public internet**. Access is limited to localhost and the local network (via `*.terrarium.local`). The acceptable risk here is bounded: an attacker would need to already be on the user's LAN.
+**Dev containers** are optimized for building. They contain dev tools (Node.js, Python, build essentials) and have broad egress access to package registries. Claude Code runs on the host and proxies shell commands into the container via hooks. The MCP server also runs on the host. Dev containers are **never exposed to the public internet**. Access is limited to localhost and the local network (via `*.terrarium.local`). The acceptable risk here is bounded: an attacker would need to already be on the user's LAN.
 
 **Deploy containers** are optimized for running. They are built from a clean OCI image containing only the app and its runtime dependencies. They do **not** contain Claude Code, the MCP server, development tools, package managers, or a shell (where feasible). The filesystem is read-only except for designated data volumes. Egress is tightly restricted. These are the containers that can be exposed to the public internet via Tailscale, cloud deployment, or remote Terrarium instances.
 
@@ -532,8 +540,8 @@ This separation gives us a clean, defensible security boundary:
 
 | Property | Dev Container | Deploy Container |
 |---|---|---|
-| Claude Code | Yes | **No** |
-| MCP Server | Yes | **No** |
+| Claude Code | On host (proxied via hooks) | **No** |
+| MCP Server | On host (stdio subprocess) | **No** |
 | Dev tools / shell | Yes | **No** (where feasible) |
 | Package managers | Yes | **No** |
 | Filesystem | Read-write | **Read-only** (except data volumes) |
@@ -590,36 +598,39 @@ When a project is deployed, the deploy engine builds a hardened image:
 
 ## 9. Desktop App UI
 
+The desktop app is intentionally simple — a single-view project dashboard. Users interact with Claude Code via their own Claude Code installation (Desktop app or CLI), not through Terrarium's UI.
+
 ### 9.1 Main Dashboard
 
-The primary view is a grid/list of project cards. Each card shows:
+The primary (and only) view is a grid of project cards. Each card shows:
 
-- Project name and status indicator (running, stopped, error).
-- Thumbnail or icon (could be auto-generated or set by Claude Code).
+- Project name and status indicator (running, stopped, creating, error).
+- Workspace path (`~/Terrarium/<name>/`).
+- Creation date.
+- **Open Terminal** button — opens Terminal.app at the project workspace directory.
+- **Delete** button — removes the container, namespace, and workspace directory.
+
+Above the project grid:
+
+- **VM Status Bar** — shows Lima VM status, version, and start/stop controls.
+- **+ New Project** button — opens a dialog to name and create a new project.
+
+### 9.2 Future Enhancements
+
+As the project matures, the dashboard could grow to include:
+
 - Quick action buttons (as configured by Claude Code via MCP).
 - Resource summary (containers, ports, memory usage).
 - Deploy status if a pinned/remote/cloud deploy exists.
+- Project detail view with logs, resources, deploys, metrics, settings, and audit log tabs.
 
-### 9.2 Project Detail View
-
-Clicking a project card opens the detail view:
-
-- **Overview tab:** Status, resource summary, action buttons, links.
-- **Logs tab:** Real-time log viewer with tabs for each named sink. Searchable, scrollable, with auto-scroll and pause.
-- **Resources tab:** Visual list of containers, ports, volumes, host mounts, cron jobs. Each can be started/stopped/inspected individually.
-- **Deploys tab:** List of local, remote, and cloud deployments with their status, logs, and controls.
-- **Metrics tab:** Graphs for CPU, memory, network, request count, error rate (if configured).
-- **Settings tab:** Project name, resource limits, egress allowlist, secret management, danger zone (delete project, delete data).
-- **Audit log tab:** Chronological log of all MCP calls and system events.
-
-### 9.3 Global Settings
+### 9.3 Global Settings *(Future)*
 
 - Container runtime configuration (memory allocation to the VM, disk limits).
 - Reverse proxy settings (TLS CA management, port configuration).
 - Remote targets (add/remove remote Terrarium instances).
 - Cloud provider credentials.
 - Default egress allowlist.
-- Tailscale account connection.
 
 ---
 
@@ -627,13 +638,14 @@ Clicking a project card opens the detail view:
 
 ### Phase 1 — Foundation (MVP)
 
-- macOS desktop app shell with project dashboard.
+- macOS desktop app (Tauri) with project dashboard.
 - Container runtime integration (Lima + containerd/nerdctl via Apple VZ).
-- Dev container provisioning with Claude Code pre-installed.
-- MCP server with core resource tools (containers, ports, volumes).
-- `TERRARIUM.md` generation and mounting.
+- Dev container provisioning with workspace bind-mount via virtiofs.
+- Hooks-based command proxying (`PreToolUse` hook routes Bash into container).
+- MCP server running on host with core resource tools (env info, allocate ports).
+- Project workspace setup (`~/Terrarium/<name>/` with `.claude/settings.json`, `.mcp.json`, `.terrarium/config.json`).
+- "Open Terminal" button to launch Claude Code in the project directory.
 - Basic project lifecycle (create, start, stop, delete).
-- Terminal window for Claude Code sessions (persistent via tmux).
 
 ### Phase 2 — Developer Experience
 
@@ -680,17 +692,25 @@ Clicking a project card opens the detail view:
 
 | Decision | Outcome |
 |---|---|
-| **Container runtime** | Lima with containerd/nerdctl on Apple's Virtualization.framework. Shared VM, per-project containerd namespaces. |
+| **Desktop app** | Tauri 2 (Rust backend + React/TypeScript frontend). Open source, cross-platform potential. |
+| **Container runtime** | Lima with containerd/nerdctl on Apple's Virtualization.framework. Shared VM with prefixed container names in the default namespace. |
+| **Claude Code integration** | Runs on the host (Desktop app or CLI). Bash commands proxied into container via `PreToolUse` hooks. File operations work directly on shared filesystem via virtiofs. |
+| **MCP server location** | Runs on the **host** as a stdio subprocess of Claude Code (configured in `.mcp.json`). Communicates with Terrarium desktop app via host API (HTTP port 7778). |
 | **Security model** | Two profiles: dev containers are permissive but localhost/LAN only; deploy containers are hardened and can face the internet. |
-| **MCP server location** | Runs inside the dev container. Not present in deploy containers. |
-| **TERRARIUM.md vs. MCP** | Static orientation file baked into the base image. All live state accessed via MCP calls. |
-| **Base image** | Minimal (git, curl, build essentials). Runtimes installed by Claude Code at dev time. |
+| **Workspace location** | `~/Terrarium/<project-name>/` — user-friendly, visible in Finder, shared with container via virtiofs bind-mount. |
+| **Command proxying** | `PreToolUse` hooks are deterministic and transparent, unlike CLAUDE.md instructions which LLMs don't always follow. Every Bash command is guaranteed to be proxied. |
+| **Base image** | Minimal (git, curl, build essentials, Node.js, Python). |
 | **Data persistence** | Deploys start with empty volumes. Bootstrap steps run once on first deploy. Snapshot/restore as a future enhancement. |
-| **Claude Code updates** | Auto-update on container restart by default. Advanced toggle to pin a specific version. |
 | **Business model** | Open source. Terrarium Cloud as a future hosted deployment service. |
 
 ## 12. Implementation Notes
 
-**Lima performance benchmarking.** Before committing to specific resource defaults, benchmark Lima's VZ backend on Apple Silicon for: cold VM start time (target: under 5 seconds), per-container start time (target: under 2 seconds), idle memory footprint, and virtio-fs filesystem throughput.
+**Lima VM configuration.** The Lima VM (`lima-terrarium.yaml`) uses Apple's Virtualization.framework (VZ) with virtiofs mounts. The home directory is mounted read-only, with `~/Terrarium` mounted writable. This requires VM recreation if the mount configuration changes.
 
-**MCP host communication.** The MCP server inside the dev container needs a channel back to the desktop app's Resource Manager on the host (for resource requests, UI updates, notifications, etc.). The specific mechanism — Unix socket mounted into the container, TCP port on the host VM bridge, or virtio-vsock — is an implementation detail that will be determined during Lima integration work. Any of these approaches satisfy the architectural requirements; the choice should optimize for reliability and simplicity of setup.
+**Command proxying latency.** The `limactl shell → nerdctl exec` chain adds ~1-2s overhead per Bash command. This is acceptable for development but noticeable for quick operations like `ls`. The temp file approach (writing commands to `/tmp/terrarium-cmd-*` and piping via stdin) avoids shell quoting issues that arise from SSH argument re-tokenization.
+
+**MCP host communication.** The MCP server runs on the host as a stdio subprocess of Claude Code. It communicates with the Terrarium desktop app via HTTP on port 7778 (the host API). This is simple and reliable — no need for Unix sockets, vsock, or other IPC mechanisms through the VM boundary.
+
+**Project isolation.** Each project gets its own container in the default containerd namespace, prefixed with `terrarium-<project-id>-dev`. We avoid per-project namespaces because copying the dev base image into each namespace is expensive. Container and volume names are globally unique via the project UUID.
+
+**Lima performance benchmarking.** Before committing to specific resource defaults, benchmark Lima's VZ backend on Apple Silicon for: cold VM start time (target: under 5 seconds), per-container start time (target: under 2 seconds), idle memory footprint, and virtio-fs filesystem throughput.

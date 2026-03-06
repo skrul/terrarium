@@ -7,6 +7,8 @@ mountType: "virtiofs"
 mounts:
   - location: "~"
     writable: false
+  - location: "~/Terrarium"
+    writable: true
 
 images:
   - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
