@@ -1,43 +1,32 @@
-import { readFile } from "node:fs/promises";
-import { cpus, totalmem } from "node:os";
+import { cpus, totalmem, platform, arch } from "node:os";
 import { existsSync } from "node:fs";
 import { readState } from "../state.js";
 
 interface EnvInfo {
   os: string;
+  arch: string;
   user: string;
   workspace: string;
   workspaceExists: boolean;
+  containerName: string;
   nodeVersion: string;
   memoryMB: number;
   cpuCount: number;
   allocatedPorts: Record<string, number>;
 }
 
-async function getOsInfo(): Promise<string> {
-  try {
-    const content = await readFile("/etc/os-release", "utf-8");
-    const prettyName = content
-      .split("\n")
-      .find((line) => line.startsWith("PRETTY_NAME="));
-    if (prettyName) {
-      return prettyName.split("=")[1].replace(/"/g, "");
-    }
-  } catch {
-    // fall through
-  }
-  return "Linux (unknown)";
-}
-
 export async function getEnvInfo(): Promise<EnvInfo> {
-  const workspace = "/home/terrarium/workspace";
+  const workspace = process.env.TERRARIUM_WORKSPACE ?? "";
+  const containerName = process.env.TERRARIUM_CONTAINER_NAME ?? "";
   const state = await readState();
 
   return {
-    os: await getOsInfo(),
-    user: process.env.USER ?? "terrarium",
+    os: platform(),
+    arch: arch(),
+    user: process.env.USER ?? "unknown",
     workspace,
-    workspaceExists: existsSync(workspace),
+    workspaceExists: workspace !== "" && existsSync(workspace),
+    containerName,
     nodeVersion: process.version,
     memoryMB: Math.round(totalmem() / (1024 * 1024)),
     cpuCount: cpus().length,

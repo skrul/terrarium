@@ -16,7 +16,7 @@ use tauri::State;
 use uuid::Uuid;
 
 pub struct AppState {
-    projects: Mutex<Vec<Project>>,
+    projects: Arc<Mutex<Vec<Project>>>,
     runtime: Arc<LimaRuntime>,
     host_api_port: u16,
 }
@@ -24,7 +24,7 @@ pub struct AppState {
 impl AppState {
     fn new(host_api_port: u16) -> Self {
         Self {
-            projects: Mutex::new(Vec::new()),
+            projects: Arc::new(Mutex::new(Vec::new())),
             runtime: Arc::new(LimaRuntime::new()),
             host_api_port,
         }
@@ -102,7 +102,9 @@ fn setup_workspace(
                 "args": [mcp_server_path.to_string_lossy()],
                 "env": {
                     "TERRARIUM_HOST_API": format!("http://localhost:{}", HOST_API_PORT),
-                    "TERRARIUM_PROJECT_ID": project_id
+                    "TERRARIUM_PROJECT_ID": project_id,
+                    "TERRARIUM_WORKSPACE": workspace.to_string_lossy(),
+                    "TERRARIUM_CONTAINER_NAME": container_name
                 }
             }
         }
@@ -131,6 +133,10 @@ fn setup_workspace(
          - **File operations** (read, write, edit, search) work directly on this directory.\n\
          - **Shell commands** (bash) are automatically proxied into your dev container.\n\
          - The container has Node.js, Python, and common dev tools pre-installed.\n\n\
+         ## Rules\n\n\
+         - **Always use the Bash tool to start servers and run commands.** Never create launch.json or run configurations. \
+         All commands must go through Bash so they execute inside the container.\n\
+         - Do not create or modify `.claude/launch.json`.\n\n\
          ## Tips\n\n\
          - Run `node -v` or `python3 --version` to verify the container environment.\n\
          - Files you create here are immediately visible inside the container.\n\
@@ -141,6 +147,69 @@ fn setup_workspace(
         .map_err(|e| format!("Failed to write .claude/CLAUDE.md: {}", e))?;
 
     Ok(workspace)
+}
+
+/// Scan ~/Terrarium/ for existing project workspaces and reconstruct Project structs.
+fn load_projects() -> Vec<Project> {
+    let base = terrarium_base_dir();
+    let mut projects = Vec::new();
+
+    let entries = match std::fs::read_dir(&base) {
+        Ok(entries) => entries,
+        Err(_) => return projects,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let config_path = path.join(".terrarium/config.json");
+        let config_data = match std::fs::read_to_string(&config_path) {
+            Ok(data) => data,
+            Err(_) => continue, // Not a Terrarium project
+        };
+
+        let config: serde_json::Value = match serde_json::from_str(&config_data) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let project_id = match config.get("project_id").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => continue,
+        };
+
+        let container_name = config
+            .get("container_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let _ = container_name; // used implicitly via project_id -> container naming
+
+        let created_at = config
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        projects.push(Project {
+            id: project_id,
+            name,
+            status: ProjectStatus::Stopped,
+            created_at,
+            workspace_path: path.to_string_lossy().to_string(),
+        });
+    }
+
+    projects
 }
 
 /// Delete the workspace directory for a project.
@@ -376,16 +445,56 @@ pub fn run() {
             }
 
             let app_state = AppState::new(host_api_port);
+
+            // Load persisted projects from ~/Terrarium/
+            let loaded = load_projects();
+            if !loaded.is_empty() {
+                eprintln!("Loaded {} project(s) from disk", loaded.len());
+            }
+            {
+                let mut projs = app_state.projects.blocking_lock();
+                *projs = loaded;
+            }
+
             app.manage(app_state);
 
-            // Background VM start if it already exists
+            // Background VM start + project status refresh
             let state = app.state::<AppState>();
             let runtime = state.runtime.clone();
+            let projects = Arc::clone(&state.projects);
 
             tauri::async_runtime::spawn(async move {
                 let status = runtime.vm_status().await;
                 if status == VmStatus::Stopped {
-                    let _ = runtime.start_vm().await;
+                    if let Err(e) = runtime.start_vm().await {
+                        eprintln!("Failed to start VM: {}", e);
+                        return;
+                    }
+                }
+
+                // Refresh container statuses for loaded projects
+                let project_ids: Vec<String> = {
+                    projects.lock().await.iter().map(|p| p.id.clone()).collect()
+                };
+
+                for id in project_ids {
+                    match runtime.dev_container_status(&id).await {
+                        Ok(container_status) => {
+                            let new_status = match container_status {
+                                runtime::types::ContainerStatus::Running => ProjectStatus::Running,
+                                runtime::types::ContainerStatus::Stopped => ProjectStatus::Stopped,
+                                runtime::types::ContainerStatus::NotCreated => ProjectStatus::Stopped,
+                                runtime::types::ContainerStatus::Unknown { .. } => ProjectStatus::Error,
+                            };
+                            let mut projs = projects.lock().await;
+                            if let Some(p) = projs.iter_mut().find(|p| p.id == id) {
+                                p.status = new_status;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to check container status for {}: {}", id, e);
+                        }
+                    }
                 }
             });
 

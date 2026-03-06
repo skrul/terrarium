@@ -358,6 +358,7 @@ impl ContainerRuntime for LimaRuntime {
                 None,
                 &[
                     "run", "-d", "--name", &container,
+                    "--net=host",
                     "-v", &volume_mount,
                     "-v", &workspace_mount,
                     DEV_IMAGE,

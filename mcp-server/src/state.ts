@@ -1,7 +1,14 @@
 import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 
-const STATE_PATH = "/etc/terrarium/state.json";
+function getStatePath(): string {
+  const workspace = process.env.TERRARIUM_WORKSPACE;
+  if (workspace) {
+    return join(workspace, ".terrarium", "state.json");
+  }
+  // Fallback for development/testing
+  return "/tmp/terrarium-state.json";
+}
 
 export interface TerrariumState {
   ports: Record<string, number>;
@@ -13,7 +20,7 @@ function defaultState(): TerrariumState {
 
 export async function readState(): Promise<TerrariumState> {
   try {
-    const data = await readFile(STATE_PATH, "utf-8");
+    const data = await readFile(getStatePath(), "utf-8");
     return JSON.parse(data) as TerrariumState;
   } catch {
     return defaultState();
@@ -21,6 +28,7 @@ export async function readState(): Promise<TerrariumState> {
 }
 
 export async function writeState(state: TerrariumState): Promise<void> {
-  await mkdir(dirname(STATE_PATH), { recursive: true });
-  await writeFile(STATE_PATH, JSON.stringify(state, null, 2), "utf-8");
+  const statePath = getStatePath();
+  await mkdir(dirname(statePath), { recursive: true });
+  await writeFile(statePath, JSON.stringify(state, null, 2), "utf-8");
 }
