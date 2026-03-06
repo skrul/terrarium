@@ -3,6 +3,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { getEnvInfo } from "./tools/env-info.js";
 import { allocatePort } from "./tools/allocate-port.js";
+import { listPorts } from "./tools/list-ports.js";
+import { releasePort } from "./tools/release-port.js";
 
 const server = new McpServer({
   name: "terrarium",
@@ -33,6 +35,58 @@ server.tool(
   async ({ name, port }) => {
     try {
       const result = await allocatePort(name, port);
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (err) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text: err instanceof Error ? err.message : String(err),
+          },
+        ],
+      };
+    }
+  },
+);
+
+// terrarium.resources.listPorts — list all allocated ports
+server.tool(
+  "terrarium.resources.listPorts",
+  "List all allocated ports and their URLs",
+  {},
+  async () => {
+    try {
+      const result = await listPorts();
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (err) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text: err instanceof Error ? err.message : String(err),
+          },
+        ],
+      };
+    }
+  },
+);
+
+// terrarium.resources.releasePort — release a named port allocation
+server.tool(
+  "terrarium.resources.releasePort",
+  "Release a previously allocated port by name. Removes the allocation and unregisters the proxy route.",
+  {
+    name: z.string().describe("Name of the port allocation to release"),
+  },
+  async ({ name }) => {
+    try {
+      const result = await releasePort(name);
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
       };

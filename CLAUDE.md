@@ -31,7 +31,7 @@ See Section 10 of the architecture doc. The deliverables are:
 2. Lima integration — programmatically create and manage a shared VM with containerd.
 3. Dev container provisioning — spin up a container with workspace bind-mount.
 4. Hooks-based command proxying — `PreToolUse` hook transparently routes Bash commands into the container.
-5. MCP server with core resource tools (env info, allocate ports).
+5. MCP server with core resource tools (env info, allocate/list/release ports).
 6. Project workspace setup — `~/Terrarium/<name>/` with `.claude/settings.json`, `.mcp.json`, `.terrarium/config.json`, `.claude/CLAUDE.md`.
 7. "Open Terminal" button — opens a terminal at the project workspace for the user to run Claude Code.
 
@@ -65,6 +65,7 @@ The Terrarium MCP server runs on the host as a stdio subprocess of Claude Code (
 - **Dev containers are never publicly exposed.** Only deploy containers (Phase 4+) can face the internet.
 - **The project workspace lives on the host.** At `~/Terrarium/<project-name>/`. The `.terrarium/config.json` file stores project metadata (project ID, container name).
 - **This is open source.** No commercial dependencies in the core. Lima is Apache 2.0. All dependencies should have compatible licenses.
+- **Keep MCP docs in sync.** When adding or changing MCP tools, you must update all three places: (1) the tool's `description` string in `mcp-server/src/index.ts`, (2) the per-project template at `desktop/src-tauri/templates/CLAUDE.md`, and (3) this file's description of MCP tools. Claude Code users rely on these descriptions to discover and use tools correctly.
 
 ## Repository Structure
 

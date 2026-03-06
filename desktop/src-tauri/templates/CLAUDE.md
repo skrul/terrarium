@@ -20,6 +20,11 @@ Example: if `allocatePort` returns `{{"name": "web", "port": 3000, "url": "https
 
 **Always allocate a port before starting a server.** Do not hardcode ports or use arbitrary port numbers.
 
+### Managing ports
+
+- **`terrarium.resources.listPorts`** — List all allocated ports and their URLs.
+- **`terrarium.resources.releasePort`** — Release a port allocation by name when it's no longer needed.
+
 ## Rules
 
 - **Always use the Bash tool to start servers and run commands.** Never create launch.json or run configurations. All commands must go through Bash so they execute inside the container.
