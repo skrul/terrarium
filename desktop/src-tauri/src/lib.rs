@@ -51,6 +51,68 @@ fn terrarium_base_dir() -> PathBuf {
         .join("Terrarium")
 }
 
+/// Generate the CLAUDE.md content for a project workspace.
+fn generate_claude_md(project_name: &str) -> String {
+    const TEMPLATE: &str = include_str!("../templates/CLAUDE.md");
+    TEMPLATE.replace("{name}", project_name)
+}
+
+/// Generate the .claude/settings.local.json content.
+fn generate_settings_local() -> serde_json::Value {
+    serde_json::json!({
+        "enableAllProjectMcpServers": true
+    })
+}
+
+/// Generate the .claude/settings.json content.
+fn generate_claude_settings(hook_script: &std::path::Path) -> serde_json::Value {
+    serde_json::json!({
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": hook_script.to_string_lossy()
+                }]
+            }]
+        },
+        "permissions": {
+            "allow": [
+                "Bash(*)",
+                "Read(*)",
+                "Write(*)",
+                "Edit(*)",
+                "mcp__terrarium(*)"
+            ]
+        }
+    })
+}
+
+/// Generate the .mcp.json content.
+fn generate_mcp_config(
+    mcp_server_path: &std::path::Path,
+    project_id: &str,
+    project_name: &str,
+    workspace: &std::path::Path,
+    container_name: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "mcpServers": {
+            "terrarium": {
+                "command": "node",
+                "args": [mcp_server_path.to_string_lossy()],
+                "env": {
+                    "TERRARIUM_HOST_API": format!("http://localhost:{}", HOST_API_PORT),
+                    "TERRARIUM_PROJECT_ID": project_id,
+                    "TERRARIUM_PROJECT_NAME": project_name,
+                    "TERRARIUM_WORKSPACE": workspace.to_string_lossy(),
+                    "TERRARIUM_CONTAINER_NAME": container_name
+                }
+            }
+        }
+    })
+}
+
 /// Create the workspace directory and config files for a new project.
 fn setup_workspace(
     project_id: &str,
@@ -81,58 +143,23 @@ fn setup_workspace(
 
     // Write .claude/settings.json with hooks and permissions
     let hook_script = hooks_dir.join("terrarium-proxy.sh");
-    let claude_settings = serde_json::json!({
-        "hooks": {
-            "PreToolUse": [{
-                "matcher": "Bash",
-                "hooks": [{
-                    "type": "command",
-                    "command": hook_script.to_string_lossy()
-                }]
-            }]
-        },
-        "permissions": {
-            "allow": [
-                "Bash(*)",
-                "Read(*)",
-                "Write(*)",
-                "Edit(*)",
-                "mcp__terrarium(*)"
-            ]
-        }
-    });
+    let claude_settings = generate_claude_settings(&hook_script);
     std::fs::write(
         workspace.join(".claude/settings.json"),
         serde_json::to_string_pretty(&claude_settings).unwrap(),
     )
     .map_err(|e| format!("Failed to write .claude/settings.json: {}", e))?;
 
-    // Write .mcp.json at project root (Claude Code reads MCP servers from here)
-    let mcp_config = serde_json::json!({
-        "mcpServers": {
-            "terrarium": {
-                "command": "node",
-                "args": [mcp_server_path.to_string_lossy()],
-                "env": {
-                    "TERRARIUM_HOST_API": format!("http://localhost:{}", HOST_API_PORT),
-                    "TERRARIUM_PROJECT_ID": project_id,
-                    "TERRARIUM_PROJECT_NAME": project_name,
-                    "TERRARIUM_WORKSPACE": workspace.to_string_lossy(),
-                    "TERRARIUM_CONTAINER_NAME": container_name
-                }
-            }
-        }
-    });
+    // Write .mcp.json at project root
+    let mcp_config = generate_mcp_config(mcp_server_path, project_id, project_name, &workspace, container_name);
     std::fs::write(
         workspace.join(".mcp.json"),
         serde_json::to_string_pretty(&mcp_config).unwrap(),
     )
     .map_err(|e| format!("Failed to write .mcp.json: {}", e))?;
 
-    // Write .claude/settings.local.json to pre-approve MCP servers
-    let settings_local = serde_json::json!({
-        "enableAllProjectMcpServers": true
-    });
+    // Write .claude/settings.local.json
+    let settings_local = generate_settings_local();
     std::fs::write(
         workspace.join(".claude/settings.local.json"),
         serde_json::to_string_pretty(&settings_local).unwrap(),
@@ -140,27 +167,98 @@ fn setup_workspace(
     .map_err(|e| format!("Failed to write .claude/settings.local.json: {}", e))?;
 
     // Write .claude/CLAUDE.md
-    let claude_md = format!(
-        "# {name}\n\n\
-         This is a Terrarium project. Your development environment runs inside a sandboxed container.\n\n\
-         ## How it works\n\n\
-         - **File operations** (read, write, edit, search) work directly on this directory.\n\
-         - **Shell commands** (bash) are automatically proxied into your dev container.\n\
-         - The container has Node.js, Python, and common dev tools pre-installed.\n\n\
-         ## Rules\n\n\
-         - **Always use the Bash tool to start servers and run commands.** Never create launch.json or run configurations. \
-         All commands must go through Bash so they execute inside the container.\n\
-         - Do not create or modify `.claude/launch.json`.\n\n\
-         ## Tips\n\n\
-         - Run `node -v` or `python3 --version` to verify the container environment.\n\
-         - Files you create here are immediately visible inside the container.\n\
-         - Use `ls /` to explore the container filesystem.\n",
-        name = project_name,
-    );
-    std::fs::write(workspace.join(".claude/CLAUDE.md"), claude_md)
+    std::fs::write(workspace.join(".claude/CLAUDE.md"), generate_claude_md(project_name))
         .map_err(|e| format!("Failed to write .claude/CLAUDE.md: {}", e))?;
 
     Ok(workspace)
+}
+
+/// Refresh Terrarium-managed config files in an existing project workspace.
+/// Overwrites files we fully own, merges files that may contain user additions.
+fn refresh_workspace(
+    workspace: &std::path::Path,
+    project_id: &str,
+    project_name: &str,
+    container_name: &str,
+    hooks_dir: &std::path::Path,
+    mcp_server_path: &std::path::Path,
+) -> Result<(), String> {
+    // Ensure directories exist
+    std::fs::create_dir_all(workspace.join(".claude"))
+        .map_err(|e| format!("Failed to create .claude dir: {}", e))?;
+
+    // OVERWRITE: .claude/CLAUDE.md — fully Terrarium-controlled
+    std::fs::write(
+        workspace.join(".claude/CLAUDE.md"),
+        generate_claude_md(project_name),
+    )
+    .map_err(|e| format!("Failed to write .claude/CLAUDE.md: {}", e))?;
+
+    // OVERWRITE: .claude/settings.local.json — single Terrarium key
+    std::fs::write(
+        workspace.join(".claude/settings.local.json"),
+        serde_json::to_string_pretty(&generate_settings_local()).unwrap(),
+    )
+    .map_err(|e| format!("Failed to write .claude/settings.local.json: {}", e))?;
+
+    // MERGE: .claude/settings.json — preserve user-added permissions
+    let hook_script = hooks_dir.join("terrarium-proxy.sh");
+    let template = generate_claude_settings(&hook_script);
+    let settings_path = workspace.join(".claude/settings.json");
+    let mut existing: serde_json::Value = std::fs::read_to_string(&settings_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    // Set hooks.PreToolUse — we own the entire hooks config
+    existing["hooks"] = template["hooks"].clone();
+
+    // Merge permissions.allow — add our entries, keep user extras
+    let our_perms = template["permissions"]["allow"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let existing_perms = existing["permissions"]["allow"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+
+    let mut merged_perms = existing_perms;
+    for perm in &our_perms {
+        if !merged_perms.contains(perm) {
+            merged_perms.push(perm.clone());
+        }
+    }
+    existing["permissions"]["allow"] = serde_json::Value::Array(merged_perms);
+
+    std::fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&existing).unwrap(),
+    )
+    .map_err(|e| format!("Failed to write .claude/settings.json: {}", e))?;
+
+    // MERGE: .mcp.json — set mcpServers.terrarium, preserve other servers
+    let mcp_template = generate_mcp_config(mcp_server_path, project_id, project_name, workspace, container_name);
+    let mcp_path = workspace.join(".mcp.json");
+    let mut existing_mcp: serde_json::Value = std::fs::read_to_string(&mcp_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({"mcpServers": {}}));
+
+    // Ensure mcpServers object exists
+    if !existing_mcp.get("mcpServers").map_or(false, |v| v.is_object()) {
+        existing_mcp["mcpServers"] = serde_json::json!({});
+    }
+    // Set just the terrarium key, preserving other servers
+    existing_mcp["mcpServers"]["terrarium"] = mcp_template["mcpServers"]["terrarium"].clone();
+
+    std::fs::write(
+        &mcp_path,
+        serde_json::to_string_pretty(&existing_mcp).unwrap(),
+    )
+    .map_err(|e| format!("Failed to write .mcp.json: {}", e))?;
+
+    Ok(())
 }
 
 /// Scan ~/Terrarium/ for existing project workspaces and reconstruct Project structs.
@@ -492,6 +590,42 @@ pub fn run() {
             if !loaded.is_empty() {
                 eprintln!("Loaded {} project(s) from disk", loaded.len());
             }
+
+            // Refresh workspace configs for existing projects (best-effort)
+            if !loaded.is_empty() {
+                match (app_state.runtime.find_hooks_dir(), app_state.runtime.find_mcp_server()) {
+                    (Ok(hooks_dir), Ok(mcp_server_path)) => {
+                        let mut refreshed = 0;
+                        for project in &loaded {
+                            let workspace = std::path::Path::new(&project.workspace_path);
+                            // Read container_name from .terrarium/config.json
+                            let container_name = std::fs::read_to_string(workspace.join(".terrarium/config.json"))
+                                .ok()
+                                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                                .and_then(|v| v.get("container_name")?.as_str().map(String::from))
+                                .unwrap_or_else(|| format!("terrarium-{}-dev", &project.id));
+
+                            match refresh_workspace(
+                                workspace,
+                                &project.id,
+                                &project.name,
+                                &container_name,
+                                &hooks_dir,
+                                &mcp_server_path,
+                            ) {
+                                Ok(()) => refreshed += 1,
+                                Err(e) => eprintln!("Failed to refresh workspace for '{}': {}", project.name, e),
+                            }
+                        }
+                        if refreshed > 0 {
+                            eprintln!("Refreshed {} project workspace(s)", refreshed);
+                        }
+                    }
+                    (Err(e), _) => eprintln!("Skipping workspace refresh: hooks dir not found: {}", e),
+                    (_, Err(e)) => eprintln!("Skipping workspace refresh: MCP server not found: {}", e),
+                }
+            }
+
             {
                 let mut projs = app_state.projects.blocking_lock();
                 *projs = loaded;
