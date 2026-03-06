@@ -1,6 +1,8 @@
 mod error;
 mod host_api;
+mod mdns;
 mod project;
+mod proxy;
 mod runtime;
 
 use std::path::PathBuf;
@@ -18,14 +20,25 @@ use uuid::Uuid;
 pub struct AppState {
     projects: Arc<Mutex<Vec<Project>>>,
     runtime: Arc<LimaRuntime>,
+    proxy: Arc<proxy::ProxyManager>,
+    tls_manager: Arc<proxy::TlsManager>,
+    mdns: Arc<mdns::MdnsRegistrar>,
     host_api_port: u16,
 }
 
 impl AppState {
-    fn new(host_api_port: u16) -> Self {
+    fn new(
+        host_api_port: u16,
+        proxy: Arc<proxy::ProxyManager>,
+        tls_manager: Arc<proxy::TlsManager>,
+        mdns: Arc<mdns::MdnsRegistrar>,
+    ) -> Self {
         Self {
             projects: Arc::new(Mutex::new(Vec::new())),
             runtime: Arc::new(LimaRuntime::new()),
+            proxy,
+            tls_manager,
+            mdns,
             host_api_port,
         }
     }
@@ -103,6 +116,7 @@ fn setup_workspace(
                 "env": {
                     "TERRARIUM_HOST_API": format!("http://localhost:{}", HOST_API_PORT),
                     "TERRARIUM_PROJECT_ID": project_id,
+                    "TERRARIUM_PROJECT_NAME": project_name,
                     "TERRARIUM_WORKSPACE": workspace.to_string_lossy(),
                     "TERRARIUM_CONTAINER_NAME": container_name
                 }
@@ -310,14 +324,20 @@ async fn create_project(name: String, state: State<'_, AppState>) -> Result<Proj
 
 #[tauri::command]
 async fn delete_project(id: String, state: State<'_, AppState>) -> Result<(), String> {
-    // Get workspace path before removing from list
-    let workspace_path = {
+    // Get project info before removing from list
+    let project_info = {
         let projects = state.projects.lock().await;
         projects
             .iter()
             .find(|p| p.id == id)
-            .map(|p| p.workspace_path.clone())
+            .map(|p| (p.workspace_path.clone(), p.name.clone()))
     };
+
+    // Remove proxy routes and mDNS records for this project
+    if let Some((_, ref project_name)) = project_info {
+        state.proxy.remove_project_routes(project_name);
+        let _ = state.mdns.deregister(project_name);
+    }
 
     // Remove dev container first (best effort — VM might not be running)
     let _ = state.runtime.remove_dev_container(&id).await;
@@ -326,7 +346,7 @@ async fn delete_project(id: String, state: State<'_, AppState>) -> Result<(), St
     let _ = state.runtime.delete_namespace(&id).await;
 
     // Remove workspace directory
-    if let Some(path) = workspace_path {
+    if let Some((path, _)) = project_info {
         remove_workspace(&path);
     }
 
@@ -379,12 +399,33 @@ async fn open_in_terminal(id: String, state: State<'_, AppState>) -> Result<(), 
     Ok(())
 }
 
-
-
 const HOST_API_PORT: u16 = 7778;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Initialize mDNS registrar
+    let mdns = Arc::new(
+        mdns::MdnsRegistrar::new().expect("Failed to initialize mDNS registrar"),
+    );
+
+    // Initialize TLS manager (local CA)
+    let tls_manager = Arc::new(
+        proxy::TlsManager::load_or_create().expect("Failed to initialize TLS manager"),
+    );
+
+    // Start in-process reverse proxy
+    let proxy = Arc::new(
+        tauri::async_runtime::block_on(proxy::ProxyManager::start(Arc::clone(&tls_manager)))
+            .expect("Failed to start proxy server"),
+    );
+
+    // Create shared state for host API
+    let host_api_state = Arc::new(host_api::HostApiState {
+        proxy: Arc::clone(&proxy),
+        tls_manager: Arc::clone(&tls_manager),
+        mdns: Arc::clone(&mdns),
+    });
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -397,7 +438,7 @@ pub fn run() {
             stop_vm,
             open_in_terminal,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             use tauri::Manager;
             use tauri::menu::{MenuBuilder, SubmenuBuilder, PredefinedMenuItem};
 
@@ -429,9 +470,9 @@ pub fn run() {
 
             app.set_menu(menu)?;
 
-            // Start host API server (synchronously block to get the port)
+            // Start host API server
             let host_api_port = tauri::async_runtime::block_on(async {
-                host_api::start(HOST_API_PORT).await
+                host_api::start(HOST_API_PORT, host_api_state).await
             })
             .map_err(|e| {
                 eprintln!("Failed to start host API: {}", e);
@@ -444,7 +485,7 @@ pub fn run() {
                 eprintln!("Failed to create ~/Terrarium: {}", e);
             }
 
-            let app_state = AppState::new(host_api_port);
+            let app_state = AppState::new(host_api_port, Arc::clone(&proxy), Arc::clone(&tls_manager), Arc::clone(&mdns));
 
             // Load persisted projects from ~/Terrarium/
             let loaded = load_projects();
@@ -500,6 +541,14 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            use tauri::Manager;
+            if let tauri::RunEvent::Exit = event {
+                // In-process proxy stops with the process.
+                // mDNS cleanup happens via Drop on the MdnsRegistrar.
+                eprintln!("Terrarium shutdown complete");
+            }
+        });
 }

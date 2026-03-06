@@ -11,6 +11,9 @@ pub enum TerrariumError {
     ImageBuildFailed { message: String },
     ContainerError { message: String },
     ProjectNotFound { id: String },
+    ProxyError { message: String },
+    TlsError { message: String },
+    MdnsError { message: String },
     Internal { message: String },
 }
 
@@ -39,6 +42,15 @@ impl fmt::Display for TerrariumError {
             }
             TerrariumError::ProjectNotFound { id } => {
                 write!(f, "Project not found: {}", id)
+            }
+            TerrariumError::ProxyError { message } => {
+                write!(f, "Proxy error: {}", message)
+            }
+            TerrariumError::TlsError { message } => {
+                write!(f, "TLS error: {}", message)
+            }
+            TerrariumError::MdnsError { message } => {
+                write!(f, "mDNS error: {}", message)
             }
             TerrariumError::Internal { message } => write!(f, "Internal error: {}", message),
         }

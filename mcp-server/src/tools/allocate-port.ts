@@ -9,6 +9,42 @@ interface AllocatePortResult {
   url: string;
 }
 
+interface RouteResponse {
+  hostname: string;
+  url: string;
+}
+
+async function registerRoute(
+  projectName: string,
+  serviceName: string,
+  port: number,
+): Promise<RouteResponse | null> {
+  const hostApi = process.env.TERRARIUM_HOST_API;
+  if (!hostApi) return null;
+
+  try {
+    const resp = await fetch(`${hostApi}/routes`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project_name: projectName,
+        service_name: serviceName,
+        port,
+      }),
+    });
+
+    if (resp.ok) {
+      return (await resp.json()) as RouteResponse;
+    }
+
+    console.error(`Route registration failed: ${resp.status} ${await resp.text()}`);
+    return null;
+  } catch (e) {
+    console.error(`Route registration error: ${e}`);
+    return null;
+  }
+}
+
 export async function allocatePort(
   name: string,
   preferredPort?: number,
@@ -18,7 +54,18 @@ export async function allocatePort(
   // If this name already has a port, return it
   if (state.ports[name] !== undefined) {
     const port = state.ports[name];
-    return { name, port, url: `http://localhost:${port}` };
+    const result: AllocatePortResult = { name, port, url: `http://localhost:${port}` };
+
+    // Try to register route and upgrade URL
+    const projectName = process.env.TERRARIUM_PROJECT_NAME;
+    if (projectName) {
+      const route = await registerRoute(projectName, name, port);
+      if (route) {
+        result.url = route.url;
+      }
+    }
+
+    return result;
   }
 
   let port: number;
@@ -63,5 +110,16 @@ export async function allocatePort(
   state.ports[name] = port;
   await writeState(state);
 
-  return { name, port, url: `http://localhost:${port}` };
+  const result: AllocatePortResult = { name, port, url: `http://localhost:${port}` };
+
+  // Try to register route and upgrade URL
+  const projectName = process.env.TERRARIUM_PROJECT_NAME;
+  if (projectName) {
+    const route = await registerRoute(projectName, name, port);
+    if (route) {
+      result.url = route.url;
+    }
+  }
+
+  return result;
 }
