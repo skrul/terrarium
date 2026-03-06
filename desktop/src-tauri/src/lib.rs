@@ -6,6 +6,7 @@ mod proxy;
 mod runtime;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use project::{Project, ProjectStatus};
@@ -24,6 +25,8 @@ pub struct AppState {
     tls_manager: Arc<proxy::TlsManager>,
     mdns: Arc<mdns::MdnsRegistrar>,
     host_api_port: u16,
+    keep_running: bool,
+    vm_starting: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -32,6 +35,7 @@ impl AppState {
         proxy: Arc<proxy::ProxyManager>,
         tls_manager: Arc<proxy::TlsManager>,
         mdns: Arc<mdns::MdnsRegistrar>,
+        keep_running: bool,
     ) -> Self {
         Self {
             projects: Arc::new(Mutex::new(Vec::new())),
@@ -40,6 +44,8 @@ impl AppState {
             tls_manager,
             mdns,
             host_api_port,
+            keep_running,
+            vm_starting: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -453,13 +459,80 @@ async fn delete_project(id: String, state: State<'_, AppState>) -> Result<(), St
 }
 
 #[tauri::command]
+async fn start_project(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let workspace_path = {
+        let projects = state.projects.lock().await;
+        let project = projects
+            .iter()
+            .find(|p| p.id == id)
+            .ok_or_else(|| format!("Project not found: {}", id))?;
+        project.workspace_path.clone()
+    };
+
+    // Ensure VM is ready first
+    state
+        .runtime
+        .ensure_vm_ready()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Ensure dev image exists (may have been lost if VM was recreated)
+    state
+        .runtime
+        .ensure_dev_image()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Start the container
+    state
+        .runtime
+        .run_dev_container(&id, &workspace_path)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Update project status
+    let mut projects = state.projects.lock().await;
+    if let Some(p) = projects.iter_mut().find(|p| p.id == id) {
+        p.status = ProjectStatus::Running;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn stop_project(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    // Stop the container
+    state
+        .runtime
+        .stop_dev_container(&id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Update project status
+    let mut projects = state.projects.lock().await;
+    if let Some(p) = projects.iter_mut().find(|p| p.id == id) {
+        p.status = ProjectStatus::Stopped;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
 async fn get_runtime_status(state: State<'_, AppState>) -> Result<RuntimeStatus, String> {
-    Ok(state.runtime.runtime_status().await)
+    let mut status = state.runtime.runtime_status().await;
+    if state.vm_starting.load(Ordering::Relaxed) && status.vm_status != VmStatus::Running {
+        status.vm_status = VmStatus::Starting;
+    }
+    Ok(status)
 }
 
 #[tauri::command]
 async fn get_vm_status(state: State<'_, AppState>) -> Result<VmStatus, String> {
-    Ok(state.runtime.vm_status().await)
+    let status = state.runtime.vm_status().await;
+    if state.vm_starting.load(Ordering::Relaxed) && status != VmStatus::Running {
+        return Ok(VmStatus::Starting);
+    }
+    Ok(status)
 }
 
 #[tauri::command]
@@ -474,6 +547,20 @@ async fn start_vm(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 async fn stop_vm(state: State<'_, AppState>) -> Result<(), String> {
     state.runtime.stop_vm().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn force_stop_vm(state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .runtime
+        .force_stop_vm()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_keep_running(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.keep_running)
 }
 
 /// Open a project's workspace directory in the default terminal.
@@ -501,6 +588,7 @@ const HOST_API_PORT: u16 = 7778;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let keep_running = std::env::args().any(|a| a == "--keep-running");
     // Initialize mDNS registrar
     let mdns = Arc::new(
         mdns::MdnsRegistrar::new().expect("Failed to initialize mDNS registrar"),
@@ -530,15 +618,24 @@ pub fn run() {
             list_projects,
             create_project,
             delete_project,
+            start_project,
+            stop_project,
             get_runtime_status,
             get_vm_status,
             start_vm,
             stop_vm,
+            force_stop_vm,
             open_in_terminal,
+            get_keep_running,
         ])
         .setup(move |app| {
             use tauri::Manager;
-            use tauri::menu::{MenuBuilder, SubmenuBuilder, PredefinedMenuItem};
+            use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder, PredefinedMenuItem};
+
+            // Custom quit menu item that triggers window close (which shows our shutdown dialog)
+            let quit_item = MenuItemBuilder::with_id("quit", "Quit Terrarium")
+                .accelerator("CmdOrCtrl+Q")
+                .build(app)?;
 
             // Build native macOS menu
             let app_submenu = SubmenuBuilder::new(app, "Terrarium")
@@ -548,7 +645,7 @@ pub fn run() {
                 .item(&PredefinedMenuItem::hide_others(app, Some("Hide Others"))?)
                 .item(&PredefinedMenuItem::show_all(app, Some("Show All"))?)
                 .separator()
-                .item(&PredefinedMenuItem::quit(app, Some("Quit Terrarium"))?)
+                .item(&quit_item)
                 .build()?;
 
             let edit_submenu = SubmenuBuilder::new(app, "Edit")
@@ -568,6 +665,15 @@ pub fn run() {
 
             app.set_menu(menu)?;
 
+            // Handle custom quit menu item — trigger window close to show shutdown dialog
+            app.on_menu_event(move |app, event| {
+                if event.id().0 == "quit" {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.close();
+                    }
+                }
+            });
+
             // Start host API server
             let host_api_port = tauri::async_runtime::block_on(async {
                 host_api::start(HOST_API_PORT, host_api_state).await
@@ -583,7 +689,7 @@ pub fn run() {
                 eprintln!("Failed to create ~/Terrarium: {}", e);
             }
 
-            let app_state = AppState::new(host_api_port, Arc::clone(&proxy), Arc::clone(&tls_manager), Arc::clone(&mdns));
+            let app_state = AppState::new(host_api_port, Arc::clone(&proxy), Arc::clone(&tls_manager), Arc::clone(&mdns), keep_running);
 
             // Load persisted projects from ~/Terrarium/
             let loaded = load_projects();
@@ -637,28 +743,46 @@ pub fn run() {
             let state = app.state::<AppState>();
             let runtime = state.runtime.clone();
             let projects = Arc::clone(&state.projects);
+            let vm_starting = Arc::clone(&state.vm_starting);
 
             tauri::async_runtime::spawn(async move {
-                let status = runtime.vm_status().await;
-                if status == VmStatus::Stopped {
-                    if let Err(e) = runtime.start_vm().await {
-                        eprintln!("Failed to start VM: {}", e);
-                        return;
-                    }
+                // Ensure VM is running (creates if needed, starts if stopped)
+                vm_starting.store(true, Ordering::Relaxed);
+                if let Err(e) = runtime.ensure_vm_ready().await {
+                    eprintln!("Failed to start VM: {}", e);
+                    vm_starting.store(false, Ordering::Relaxed);
+                    return;
+                }
+                vm_starting.store(false, Ordering::Relaxed);
+
+                // Ensure dev image exists before restarting containers
+                if let Err(e) = runtime.ensure_dev_image().await {
+                    eprintln!("Failed to ensure dev image: {}", e);
+                    return;
                 }
 
-                // Refresh container statuses for loaded projects
-                let project_ids: Vec<String> = {
-                    projects.lock().await.iter().map(|p| p.id.clone()).collect()
+                // Refresh container statuses for loaded projects, restarting stopped/missing containers
+                let project_info: Vec<(String, String)> = {
+                    projects.lock().await.iter().map(|p| (p.id.clone(), p.workspace_path.clone())).collect()
                 };
 
-                for id in project_ids {
+                for (id, workspace) in project_info {
                     match runtime.dev_container_status(&id).await {
                         Ok(container_status) => {
                             let new_status = match container_status {
                                 runtime::types::ContainerStatus::Running => ProjectStatus::Running,
-                                runtime::types::ContainerStatus::Stopped => ProjectStatus::Stopped,
-                                runtime::types::ContainerStatus::NotCreated => ProjectStatus::Stopped,
+                                runtime::types::ContainerStatus::Stopped
+                                | runtime::types::ContainerStatus::NotCreated => {
+                                    // Restart or recreate the container
+                                    eprintln!("Starting container for project {}", id);
+                                    match runtime.run_dev_container(&id, &workspace).await {
+                                        Ok(()) => ProjectStatus::Running,
+                                        Err(e) => {
+                                            eprintln!("Failed to start container for {}: {}", id, e);
+                                            ProjectStatus::Error
+                                        }
+                                    }
+                                }
                                 runtime::types::ContainerStatus::Unknown { .. } => ProjectStatus::Error,
                             };
                             let mut projs = projects.lock().await;
@@ -677,9 +801,9 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app, event| {
-            use tauri::Manager;
+        .run(|_app, event| {
             if let tauri::RunEvent::Exit = event {
+                // VM shutdown is handled by the frontend's ShutdownDialog.
                 // In-process proxy stops with the process.
                 // mDNS cleanup happens via Drop on the MdnsRegistrar.
                 eprintln!("Terrarium shutdown complete");

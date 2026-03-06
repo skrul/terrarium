@@ -155,8 +155,8 @@ impl ContainerRuntime for LimaRuntime {
         let status = self.vm_status().await;
 
         match status {
-            VmStatus::Running => Ok(()),
-            VmStatus::Stopped => self.start_vm().await,
+            VmStatus::Running => {}
+            VmStatus::Stopped => self.start_vm().await?,
             VmStatus::NotCreated => {
                 // Create VM from template
                 let yaml_path = self.find_vm_template()?;
@@ -181,15 +181,39 @@ impl ContainerRuntime for LimaRuntime {
                     });
                 }
 
-                self.start_vm().await
+                self.start_vm().await?;
             }
-            VmStatus::NotInstalled => Err(TerrariumError::LimaNotInstalled),
+            VmStatus::NotInstalled => return Err(TerrariumError::LimaNotInstalled),
             VmStatus::Starting => {
-                // Already starting, wait for it
-                Ok(())
+                // Already starting — fall through to SSH readiness check
             }
-            VmStatus::Error { message } => Err(TerrariumError::VmStartFailed { message }),
+            VmStatus::Error { message } => {
+                return Err(TerrariumError::VmStartFailed { message });
+            }
         }
+
+        // Wait for SSH to be ready (VM may report Running before SSH is up)
+        for i in 0..10 {
+            let mut cmd = self.limactl()?;
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                cmd.args(["shell", VM_NAME, "true"]).output(),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(output)) if output.status.success() => return Ok(()),
+                _ => {
+                    if i < 9 {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+
+        Err(TerrariumError::VmStartFailed {
+            message: "VM SSH not ready after 10 attempts".into(),
+        })
     }
 
     async fn start_vm(&self) -> Result<(), TerrariumError> {
@@ -223,6 +247,28 @@ impl ContainerRuntime for LimaRuntime {
             .await
             .map_err(|_| TerrariumError::LimaCommandFailed {
                 message: "VM stop timed out after 60s".into(),
+            })?
+            .map_err(|e| TerrariumError::LimaCommandFailed {
+                message: e.to_string(),
+            })?;
+
+        if !output.status.success() {
+            return Err(TerrariumError::LimaCommandFailed {
+                message: String::from_utf8_lossy(&output.stderr).to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn force_stop_vm(&self) -> Result<(), TerrariumError> {
+        let mut cmd = self.limactl()?;
+        let future = cmd.args(["stop", "--force", VM_NAME]).output();
+
+        let output = tokio::time::timeout(std::time::Duration::from_secs(15), future)
+            .await
+            .map_err(|_| TerrariumError::LimaCommandFailed {
+                message: "VM force stop timed out after 15s".into(),
             })?
             .map_err(|e| TerrariumError::LimaCommandFailed {
                 message: e.to_string(),
@@ -342,7 +388,8 @@ impl ContainerRuntime for LimaRuntime {
                 return Ok(());
             }
             ContainerStatus::NotCreated | ContainerStatus::Unknown { .. } => {
-                // Create and run a new container
+                // Remove any stale container before creating a new one
+                let _ = self.run_nerdctl(None, &["rm", "-f", &container]).await;
             }
         }
 
@@ -373,6 +420,24 @@ impl ContainerRuntime for LimaRuntime {
                     String::from_utf8_lossy(&output.stderr)
                 ),
             });
+        }
+
+        Ok(())
+    }
+
+    async fn stop_dev_container(&self, project_id: &str) -> Result<(), TerrariumError> {
+        let container = Self::container_name(project_id);
+
+        // -t 2: short grace period since PID 1 is `sleep infinity` which ignores SIGTERM
+        let output = self.run_nerdctl(None, &["stop", "-t", "2", &container]).await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            if !stderr.contains("not found") && !stderr.contains("no such") {
+                return Err(TerrariumError::ContainerError {
+                    message: format!("Failed to stop dev container: {}", stderr),
+                });
+            }
         }
 
         Ok(())

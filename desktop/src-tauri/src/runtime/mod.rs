@@ -26,6 +26,9 @@ pub trait ContainerRuntime: Send + Sync {
     /// Stop the VM.
     async fn stop_vm(&self) -> Result<(), TerrariumError>;
 
+    /// Force-stop the VM (immediate, no graceful shutdown).
+    async fn force_stop_vm(&self) -> Result<(), TerrariumError>;
+
     /// Create a containerd namespace for a project.
     async fn create_namespace(&self, project_id: &str) -> Result<(), TerrariumError>;
 
@@ -47,6 +50,9 @@ pub trait ContainerRuntime: Send + Sync {
         project_id: &str,
         workspace_path: &str,
     ) -> Result<(), TerrariumError>;
+
+    /// Stop the dev container for a project.
+    async fn stop_dev_container(&self, project_id: &str) -> Result<(), TerrariumError>;
 
     /// Remove the dev container from a project's namespace.
     async fn remove_dev_container(&self, project_id: &str) -> Result<(), TerrariumError>;

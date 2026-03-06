@@ -8,7 +8,6 @@ export function useVmStatus() {
   const [status, setStatus] = useState<VmStatus>("NotCreated");
   const [limaVersion, setLimaVersion] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [actionInProgress, setActionInProgress] = useState(false);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const refresh = useCallback(async () => {
@@ -31,30 +30,5 @@ export function useVmStatus() {
     };
   }, [refresh]);
 
-  const startVm = useCallback(async () => {
-    setActionInProgress(true);
-    setStatus("Starting");
-    try {
-      await invoke("start_vm");
-      await refresh();
-    } catch (e) {
-      setStatus({ Error: { message: String(e) } });
-    } finally {
-      setActionInProgress(false);
-    }
-  }, [refresh]);
-
-  const stopVm = useCallback(async () => {
-    setActionInProgress(true);
-    try {
-      await invoke("stop_vm");
-      await refresh();
-    } catch (e) {
-      setStatus({ Error: { message: String(e) } });
-    } finally {
-      setActionInProgress(false);
-    }
-  }, [refresh]);
-
-  return { status, limaVersion, loading, actionInProgress, startVm, stopVm, refresh };
+  return { status, limaVersion, loading, refresh };
 }

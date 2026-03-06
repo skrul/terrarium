@@ -6,9 +6,10 @@ import { CreateProjectDialog } from "./CreateProjectDialog";
 import { VmStatusBar } from "./VmStatusBar";
 
 export function ProjectDashboard() {
-  const { projects, loading, error, createProject, deleteProject } =
+  const { projects, loading, error, createProject, deleteProject, startProject, stopProject } =
     useProjects();
   const vm = useVmStatus();
+  const vmReady = vm.status === "Running";
   const [dialogOpen, setDialogOpen] = useState(false);
 
   if (loading) {
@@ -25,9 +26,6 @@ export function ProjectDashboard() {
         <VmStatusBar
           status={vm.status}
           limaVersion={vm.limaVersion}
-          actionInProgress={vm.actionInProgress}
-          onStart={vm.startVm}
-          onStop={vm.stopVm}
           onRetry={vm.refresh}
         />
       </div>
@@ -42,7 +40,8 @@ export function ProjectDashboard() {
         <h2 className="text-xl font-semibold text-gray-900">Projects</h2>
         <button
           onClick={() => setDialogOpen(true)}
-          className="rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700"
+          disabled={!vmReady}
+          className="rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
         >
           + New Project
         </button>
@@ -60,7 +59,10 @@ export function ProjectDashboard() {
             <ProjectCard
               key={project.id}
               project={project}
+              vmReady={vmReady}
               onDelete={deleteProject}
+              onStart={startProject}
+              onStop={stopProject}
             />
           ))}
         </div>

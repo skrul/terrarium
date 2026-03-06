@@ -3,20 +3,10 @@ import { VmStatus, isVmError } from "../types/vm";
 interface Props {
   status: VmStatus;
   limaVersion: string | null;
-  actionInProgress: boolean;
-  onStart: () => void;
-  onStop: () => void;
   onRetry: () => void;
 }
 
-export function VmStatusBar({
-  status,
-  limaVersion,
-  actionInProgress,
-  onStart,
-  onStop,
-  onRetry,
-}: Props) {
+export function VmStatusBar({ status, limaVersion, onRetry }: Props) {
   if (status === "NotInstalled") {
     return (
       <div className="rounded-md bg-red-50 px-4 py-3 text-sm text-red-800">
@@ -38,8 +28,7 @@ export function VmStatusBar({
         </span>
         <button
           onClick={onRetry}
-          disabled={actionInProgress}
-          className="rounded bg-red-600 px-3 py-1 text-xs font-medium text-white hover:bg-red-700 disabled:opacity-50"
+          className="rounded bg-red-600 px-3 py-1 text-xs font-medium text-white hover:bg-red-700"
         >
           Retry
         </button>
@@ -48,37 +37,12 @@ export function VmStatusBar({
   }
 
   return (
-    <div className="flex items-center justify-between rounded-md bg-gray-50 px-4 py-2 text-sm text-gray-600">
-      <div className="flex items-center gap-2">
-        <StatusDot status={status} />
-        <span>{statusText(status)}</span>
-        {limaVersion && (
-          <span className="text-xs text-gray-400">({limaVersion})</span>
-        )}
-      </div>
-      <div>
-        {status === "Stopped" && (
-          <button
-            onClick={onStart}
-            disabled={actionInProgress}
-            className="rounded bg-green-600 px-3 py-1 text-xs font-medium text-white hover:bg-green-700 disabled:opacity-50"
-          >
-            Start VM
-          </button>
-        )}
-        {status === "Starting" && (
-          <span className="text-xs text-gray-400">Starting...</span>
-        )}
-        {status === "Running" && (
-          <button
-            onClick={onStop}
-            disabled={actionInProgress}
-            className="rounded bg-gray-200 px-3 py-1 text-xs font-medium text-gray-700 hover:bg-gray-300 disabled:opacity-50"
-          >
-            Stop VM
-          </button>
-        )}
-      </div>
+    <div className="flex items-center gap-2 rounded-md bg-gray-50 px-4 py-2 text-sm text-gray-600">
+      <StatusDot status={status} />
+      <span>{statusText(status)}</span>
+      {limaVersion && (
+        <span className="text-xs text-gray-400">({limaVersion})</span>
+      )}
     </div>
   );
 }
@@ -97,7 +61,7 @@ function statusText(status: VmStatus): string {
     case "NotCreated":
       return "VM will be created on first project";
     case "Stopped":
-      return "VM stopped";
+      return "VM starting...";
     case "Starting":
       return "VM starting...";
     case "Running":
